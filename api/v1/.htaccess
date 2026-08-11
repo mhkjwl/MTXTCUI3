@@ -1,0 +1,12 @@
+RewriteEngine On
+RewriteBase /api/v1/
+
+RewriteRule ^profile/?$ profile/index.php [QSA,L]
+RewriteRule ^strategies/?$ strategies/index.php [QSA,L]
+RewriteRule ^upload/?$ upload/index.php [QSA,L]
+RewriteRule ^images/tokens/?$ images/tokens/index.php [QSA,L]
+RewriteRule ^images/([^/]+)/?$ images/index.php?key=$1 [QSA,L]
+RewriteRule ^images/?$ images/index.php [QSA,L]
+RewriteRule ^albums/([^/]+)/?$ albums/index.php?id=$1 [QSA,L]
+RewriteRule ^albums/?$ albums/index.php [QSA,L]
+RewriteRule ^$ index.php [QSA,L]

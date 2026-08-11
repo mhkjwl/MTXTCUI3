@@ -1,0 +1,33 @@
+# ========== 敏感数据与运行时文件（严禁入库） ==========
+
+# 全量备份目录（可能含数据库配置等敏感数据）
+backup/
+
+# 开发文档 / 日志（含备份路径、调试信息等敏感内容）
+docs/
+logs/
+
+# v1 API 运行时令牌库（含 API Token 与图片元数据）
+api/v1/data/store.json
+
+# 上传缓存 / 用户上传文件（保留 .htaccess 防脚本执行）
+api/upload/*
+!api/upload/.htaccess
+api/v1/uploads/*
+!api/v1/uploads/.htaccess
+
+# 安装锁（本地状态，不应入库）
+install.lock
+
+# 打包/备份文件
+*.zip
+*.tar.gz
+*.sql.bak
+
+# ========== 开发工具与系统文件 ==========
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
