@@ -3,8 +3,8 @@
  * @file user.php
  * @description 管理员账号信息修改页面，支持修改管理员用户名和密码，修改后同步到用户表并强制重新登录
  * @author AI
- * @version 1.1.0-dev
- * @date 2026-08-04
+ * @version 1.1.1-dev
+ * @date 2026-08-15
  */
 declare(strict_types=1);
 
@@ -17,8 +17,11 @@ if(!isset($islogin) || $islogin!=1) exit('<script>parent.location.href="login.ph
 $toast_icon = ''; $toast_title = '';
 $need_logout = false; // 标记是否需要强制退出登录（账号或密码已修改）
 if(isset($_POST['action'])) {
-    $isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
-    if($isAjax){ header('Content-Type: application/json; charset=utf-8'); }
+    // 前端统一通过 fetch 提交（按钮为 type="button"，无原生整页提交），
+    // 因此 POST 处理应始终返回 JSON，不再依赖 X-Requested-With 头——
+    // 部分环境该头会被剥离，导致误判为普通表单提交而返回 HTML，前端 response.json() 失败报“网络错误”。
+    $isAjax = true;
+    header('Content-Type: application/json; charset=utf-8');
     if(!csrf_verify()) {
         if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'安全校验失败，请刷新页面后重试！']); exit; }
         $toast_icon = 'error'; $toast_title = '安全校验失败，请刷新页面后重试！';
