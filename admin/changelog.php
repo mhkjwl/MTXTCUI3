@@ -18,10 +18,10 @@ if(!isset($islogin) || $islogin!=1) exit('<script>parent.location.href="login.ph
 // ============================================================
 // 在线更新对接（检查远程更新 + 一键升级）
 // 依据：docs/在线更新对接集成文档.md（gxrz 管理主站）
-// 远程主站：https://vipzp.sryze.cc/
+// 远程主站：https://wtgh.dpdns.org/
 // 接口：version.json（版本信息）、api/api.php（更新日志，目录重构后位于 api/ 子目录）
 // ============================================================
-define('REMOTE_UPDATE_HOST', 'https://vipzp.sryze.cc/');
+define('REMOTE_UPDATE_HOST', 'https://wtgh.dpdns.org/');
 
 /**
  * 获取远程更新信息（版本 + 更新日志）
