@@ -406,8 +406,8 @@ h4 { font-size: 14.5px; font-weight: 600; letter-spacing: -.01em; }
 .mt-16 { margin-top: 16px; }
 .mt-24 { margin-top: 24px; }
 .grid { display: grid; gap: 20px; }
-/* 卡片列数自适应容器宽度（每列最小 280px，自动拉伸填满整行，避免末行右侧留白） */
-.grid-3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); }
+/* 卡片固定列宽（280~360px，不随容器拉伸）；auto-fill 保留空轨道，仅一张卡片时也不会拉伸为整行宽、始终从首列排列 */
+.grid-3 { grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 360px)); justify-content: start; }
 .grid-4 { grid-template-columns: repeat(4, 1fr); }
 .col-span-2 { grid-column: span 2; }
 
@@ -678,6 +678,11 @@ h4 { font-size: 14.5px; font-weight: 600; letter-spacing: -.01em; }
 }
 .api-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); border-color: var(--border-strong); }
 .api-card-head { display: flex; align-items: center; gap: 13px; }
+/* 中间文本区允许收缩：长名称不会把右侧启用开关挤出卡片 */
+.api-card-head > div:not(.api-logo) { min-width: 0; }
+.api-card-head p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.api-card-head .card-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.api-card h4 .chip { flex-shrink: 0; }
 .api-logo {
   width: 44px; height: 44px; border-radius: 13px;
   display: grid; place-items: center;
@@ -710,7 +715,8 @@ h4 { font-size: 14.5px; font-weight: 600; letter-spacing: -.01em; }
   background: color-mix(in srgb, var(--surface) 60%, transparent);
   text-align: center;
   cursor: pointer;
-  min-height: 120px;
+  /* 与标准存储卡片等高（约 224px）：无存储卡片时新增卡片也保持标准卡片尺寸 */
+  min-height: 224px;
 }
 .api-card-add:hover { border-color: var(--primary); background: var(--primary-soft); }
 /* 添加卡片：+ 图标与「接入新存储」文字水平同一排 */

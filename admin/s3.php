@@ -197,7 +197,7 @@ $gradColors = array('grad-violet', 'grad-sky', 'grad-amber', 'grad-rose', 'grad-
 <script>(function(){try{var t=localStorage.getItem('admin_theme')||'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>S3 存储设置 - <?php echo $lang->admin->title;?></title>
-<link rel="stylesheet" href="style/css/admin.css?v=20260815a">
+<link rel="stylesheet" href="style/css/admin.css?v=20260815b">
 <style>
 html,body{height:100%;margin:0}body{overflow:auto}.admin-content{padding:16px 28px!important}
 
@@ -435,7 +435,7 @@ function renderCards(list){
             '<header class="api-card-head">' +
                 '<div class="api-logo '+grad+'">'+initChar+'</div>' +
                 '<div>' +
-                    '<h4>'+name+' <span class="chip '+(enabled?'chip-emerald':'chip-rose')+'">'+(enabled?'运行中':'已禁用')+'</span></h4>' +
+                    '<h4><span class="card-name" title="'+name+'">'+name+'</span> <span class="chip '+(enabled?'chip-emerald':'chip-rose')+'">'+(enabled?'运行中':'已禁用')+'</span></h4>' +
                     '<p class="muted">'+region+' · '+bucket+'</p>' +
                 '</div>' +
                 '<label class="switch">' +
