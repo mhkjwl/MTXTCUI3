@@ -108,7 +108,7 @@ unset($g);
 <script>(function(){try{var t=localStorage.getItem('admin_theme')||'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>访问控制 - <?php echo $lang->admin->title;?></title>
-<link rel="stylesheet" href="style/css/admin.css?v=20260810e">
+<link rel="stylesheet" href="style/css/admin.css?v=20260815a">
 <style>html,body{height:100%;margin:0}body{overflow:auto}.admin-content{padding:16px 28px!important}</style>
 <link rel="stylesheet" href="style/css/sweetalert2.min.css">
 <link rel="stylesheet" href="style/css/ui3-dialog.css">

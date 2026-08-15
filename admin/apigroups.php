@@ -3,8 +3,8 @@
  * @file apigroups.php
  * @description 接口分组管理页面，支持创建/编辑/删除分组并绑定图床接口与S3存储，供套餐关联使用
  * @author AI
- * @version 1.2.0-dev
- * @date 2026-08-04
+ * @version 1.2.1-dev
+ * @date 2026-08-15
  */
 declare(strict_types=1);
 
@@ -343,7 +343,7 @@ if(isset($_POST['action'])) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>接口分组管理 - <?php echo $lang->admin->title;?></title>
-<link rel="stylesheet" href="style/css/admin.css?v=20260810e">
+<link rel="stylesheet" href="style/css/admin.css?v=20260815a">
 <style>
 html,body{height:100%;margin:0}body{overflow:auto}.admin-content{padding:16px 28px!important}
 
@@ -400,10 +400,8 @@ html,body{height:100%;margin:0}body{overflow:auto}.admin-content{padding:16px 28
 
   <div class="card">
     <div class="card-header">
-      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;width:100%;">
-        <span><?php echo icon('format-list-group'); ?> 接口分组列表</span>
-        <button type="button" class="btn btn-primary btn-sm" onclick="openGroupModal(0)"><?php echo icon('plus'); ?> 新增分组</button>
-      </div>
+      <div class="card-title"><?php echo icon('format-list-group'); ?> 接口分组列表</div>
+      <button type="button" class="btn btn-primary btn-sm" onclick="openGroupModal(0)"><?php echo icon('plus'); ?> 新增分组</button>
     </div>
     <div class="card-body" style="padding:20px;">
       <div class="group-toolbar">

@@ -3,8 +3,8 @@
  * @file s3.php
  * @description S3兼容存储配置页面，采用UI3卡片网格布局管理S3存储节点，支持新增/编辑/删除/启用切换
  * @author AI
- * @version 1.3.0-dev
- * @date 2026-08-09
+ * @version 1.3.1-dev
+ * @date 2026-08-15
  */
 declare(strict_types=1);
 
@@ -197,7 +197,7 @@ $gradColors = array('grad-violet', 'grad-sky', 'grad-amber', 'grad-rose', 'grad-
 <script>(function(){try{var t=localStorage.getItem('admin_theme')||'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>S3 存储设置 - <?php echo $lang->admin->title;?></title>
-<link rel="stylesheet" href="style/css/admin.css?v=20260810k">
+<link rel="stylesheet" href="style/css/admin.css?v=20260815a">
 <style>
 html,body{height:100%;margin:0}body{overflow:auto}.admin-content{padding:16px 28px!important}
 
@@ -471,21 +471,20 @@ function renderCards(list){
         '</article>'
     );
 
-    syncAddCardWidth();
+    syncAddCardSize();
 }
 
-// 同步新增卡片尺寸：与第一张存储卡片保持一致（宽+高），避免单独成行时尺寸不匹配
-function syncAddCardWidth(){
+// 同步新增卡片高度：宽度由网格自动拉伸（与同列存储卡片天然等宽），无需 JS 干预；
+// 高度与第一张存储卡片保持一致，避免单独成行时高度不匹配
+function syncAddCardSize(){
     var firstCard = $('#s3CardGrid .api-card:not(.api-card-add)').first();
     var addCard = $('#s3CardGrid .api-card-add');
     if(!addCard.length) return;
     if(firstCard.length){
-        var w = firstCard.outerWidth();
-        var h = firstCard.outerHeight();
-        addCard.css({'width': w + 'px', 'max-width': w + 'px', 'min-height': h + 'px', 'justify-self': 'start'});
+        addCard.css('min-height', firstCard.outerHeight() + 'px');
     } else {
-        // 无存储卡片时，新增卡片恢复默认
-        addCard.css({'width': '', 'max-width': '', 'min-height': '', 'justify-self': ''});
+        // 无存储卡片时，新增卡片恢复默认高度
+        addCard.css('min-height', '');
     }
 }
 
@@ -681,14 +680,20 @@ document.addEventListener('DOMContentLoaded', function(){
         if(typeof id !== 'undefined') deleteConfig(id, name);
     });
 
-    // 窗口缩放时同步新增卡片宽度
+    // 窗口缩放时同步新增卡片高度
     var resizeTimer;
     $(window).on('resize', function(){
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(function(){
-            requestAnimationFrame(syncAddCardWidth);
+            requestAnimationFrame(syncAddCardSize);
         }, 100);
     });
+
+    // 侧栏折叠等容器尺寸变化不触发 window resize，用 ResizeObserver 兜底同步
+    var s3GridEl = document.getElementById('s3CardGrid');
+    if(window.ResizeObserver && s3GridEl){
+        new ResizeObserver(function(){ syncAddCardSize(); }).observe(s3GridEl);
+    }
 
     loadS3Configs();
 });
