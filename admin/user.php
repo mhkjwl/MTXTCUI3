@@ -59,15 +59,36 @@ if(isset($_POST['action'])) {
         $oldAdminUser = isset($conf['admin_user']) ? $conf['admin_user'] : '';
         // 字段白名单：仅允许修改管理员用户名（防止 Mass Assignment 覆盖 admin_pwd/smtp_pass 等敏感配置）
         $newAdminUser = isset($_POST['admin_user']) ? trim($_POST['admin_user']) : '';
+        $renameApplied = false; // 仅当用户表与配置同时改名成功才置为 true
         if($newAdminUser !== '' && $newAdminUser !== $oldAdminUser) {
             if(mb_strlen($newAdminUser) > 64) {
                 if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'用户名长度不能超过64个字符']); exit; }
                 $toast_icon = 'error'; $toast_title = '用户名长度不能超过64个字符';
             } else {
-                $ok = $DB->query_prepared("INSERT INTO eecms_config SET `name`='admin_user', `main`=? ON DUPLICATE KEY UPDATE `main`=?", 'ss', [$newAdminUser, $newAdminUser]);
-                if($ok === false) {
-                    if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'用户名保存失败，请重试']); exit; }
-                    $toast_icon = 'error'; $toast_title = '用户名保存失败，请重试';
+                // 重名校验：用户名在 eecms_users 中唯一，先查重再改名，避免 config 与用户表脱节
+                $dupUser = $DB->get_row_prepared("SELECT id FROM eecms_users WHERE username=? AND username<>?", 'ss', [$newAdminUser, $oldAdminUser]);
+                $selfRow = $DB->get_row_prepared("SELECT id FROM eecms_users WHERE username=?", 's', [$oldAdminUser]);
+                if($dupUser) {
+                    if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'该用户名已被其他用户占用，请更换']); exit; }
+                    $toast_icon = 'error'; $toast_title = '该用户名已被其他用户占用，请更换';
+                } elseif(!$selfRow) {
+                    if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'用户表中未找到当前管理员记录，无法改名']); exit; }
+                    $toast_icon = 'error'; $toast_title = '用户表中未找到当前管理员记录，无法改名';
+                } else {
+                    // 先改用户表再改配置；配置写入失败则回滚用户名，保证两处一致
+                    if($DB->query_prepared("UPDATE eecms_users SET username=? WHERE username=?", 'ss', [$newAdminUser, $oldAdminUser]) === false) {
+                        if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'用户名同步失败，请重试']); exit; }
+                        $toast_icon = 'error'; $toast_title = '用户名同步失败，请重试';
+                    } else {
+                        $ok = $DB->query_prepared("INSERT INTO eecms_config SET `name`='admin_user', `main`=? ON DUPLICATE KEY UPDATE `main`=?", 'ss', [$newAdminUser, $newAdminUser]);
+                        if($ok === false) {
+                            $DB->query_prepared("UPDATE eecms_users SET username=? WHERE username=?", 'ss', [$oldAdminUser, $newAdminUser]);
+                            if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'用户名保存失败，已回滚，请重试']); exit; }
+                            $toast_icon = 'error'; $toast_title = '用户名保存失败，已回滚，请重试';
+                        } else {
+                            $renameApplied = true;
+                        }
+                    }
                 }
             }
         }
@@ -95,30 +116,25 @@ if(isset($_POST['action'])) {
                 $hashed = password_hash($pwd, PASSWORD_DEFAULT);
                 $ok = $DB->query_prepared("UPDATE eecms_config SET `main`=? WHERE `name`='admin_pwd'", 's', [$hashed]);
                 if($ok === false) {
+                    $hashed = null; // 写库失败则不触发“已改密”后续流程
                     if($isAjax){ echo json_encode(['code'=>1, 'msg'=>'密码保存失败，请重试']); exit; }
                     $toast_icon = 'error'; $toast_title = '密码保存失败，请重试';
                 }
             }
         }
 
-        // 同步修改到 eecms_users 表（用户管理列表、用户中心均读取此表）
-        if($newAdminUser !== '' && $newAdminUser !== $oldAdminUser) {
-            // L6 修复：检查返回值，失败时回滚提示
-            if($DB->query_prepared("UPDATE eecms_users SET username=? WHERE username=?", 'ss', [$newAdminUser, $oldAdminUser]) === false) {
-                error_log('user.php: 同步用户名到 eecms_users 失败');
-            }
-        }
+        // 用户名同步已在上方与配置写入一并完成（失败会回滚），此处只处理密码同步
         if(!empty($pwd) && $hashed !== null) {
-            // 密码同步：用新用户名匹配（如用户名已改则用新用户名），并递增 session_version 使旧登录态失效
-            $syncUser = $newAdminUser !== '' ? $newAdminUser : $oldAdminUser;
+            // 密码同步：用真正生效的用户名匹配（改名失败时仍用旧名），并递增 session_version 使旧登录态失效
+            $syncUser = $renameApplied ? $newAdminUser : $oldAdminUser;
             if($DB->query_prepared("UPDATE eecms_users SET password=?, session_version = session_version + 1 WHERE username=?", 'ss', [$hashed, $syncUser]) === false) {
                 error_log('user.php: 同步密码到 eecms_users 失败');
             }
         }
 
         // 检测账号或密码是否实际发生变更 → 强制退出登录
-        $usernameChanged = ($newAdminUser !== '' && $newAdminUser !== $oldAdminUser);
-        $passwordChanged = !empty($pwd);
+        $usernameChanged = $renameApplied;
+        $passwordChanged = (!empty($pwd) && $hashed !== null);
 
         // L2 修复：改用 pkg_safe_get_all 封装（无参数 SELECT 也用安全封装）
         $conf = array();

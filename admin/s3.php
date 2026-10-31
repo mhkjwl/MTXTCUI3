@@ -148,11 +148,14 @@ if(isset($_POST['action'])) {
             'enabled'    => isset($_POST['s3_enabled']) ? '1' : '0',
         );
 
+        $isEditConfig = ($editId !== '' && isset($s3Configs[(int)$editId]));
+
         $errors = array();
         if(empty($entry['name'])) $errors[] = '显示名称不能为空';
         if(empty($entry['endpoint'])) $errors[] = 'Endpoint 不能为空';
         if(empty($entry['access_key'])) $errors[] = 'Access Key 不能为空';
-        if(empty($entry['secret_key'])) $errors[] = 'Secret Key 不能为空';
+        // 编辑时留空表示保持原值；仅新增配置时要求填写
+        if(empty($entry['secret_key']) && !$isEditConfig) $errors[] = 'Secret Key 不能为空';
         if(empty($entry['bucket'])) $errors[] = 'Bucket 不能为空';
         if(empty($entry['region'])) $errors[] = 'Region 不能为空';
 
@@ -161,7 +164,7 @@ if(isset($_POST['action'])) {
             exit;
         }
 
-        if($entry['secret_key'] === '__KEEP_EXISTING__' && $editId !== '' && isset($s3Configs[(int)$editId])) {
+        if($isEditConfig && ($entry['secret_key'] === '__KEEP_EXISTING__' || $entry['secret_key'] === '')) {
             $entry['secret_key'] = $s3Configs[(int)$editId]['secret_key'];
         }
         if($editId !== '' && isset($s3Configs[(int)$editId]) && strpos($entry['access_key'], '•') !== false) {

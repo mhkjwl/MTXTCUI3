@@ -119,8 +119,7 @@ function count_group_items_by_status($DB, $groupId, $conf, $s3Configs) {
             // $s3Configs 已过滤为仅 enabled==1 的条目
             if(isset($s3Configs[$s3Id])) $enabled++;
         } else {
-            $enableKey = 'api_' . $item['api_type'] . '_enable';
-            if(isset($conf[$enableKey]) && $conf[$enableKey] == '1') $enabled++;
+            if(api_config_enabled($conf, (string)$item['api_type'])) $enabled++;
         }
     }
     return array('enabled' => $enabled, 'total' => $total);
@@ -219,6 +218,12 @@ if(isset($_POST['action'])) {
             echo json_encode(array('code'=>1, 'msg'=>'参数错误'));
             exit;
         }
+        // 存在性校验：避免删除不存在的分组也返回成功
+        $grpExists = pkg_safe_get_row_prepared($DB, "SELECT id FROM eecms_api_groups WHERE id=?", 'i', [$id]);
+        if(!$grpExists) {
+            echo json_encode(array('code'=>1, 'msg'=>'分组不存在或已被删除，请刷新后重试'));
+            exit;
+        }
         // 检查是否有启用的套餐正在使用此分组
         $pkgRow = pkg_safe_get_row_prepared($DB, "SELECT COUNT(*) AS c FROM eecms_packages WHERE group_id=? AND status=1", 'i', [$id]);
         $pkgCount = $pkgRow ? (int)$pkgRow['c'] : 0;
@@ -285,7 +290,7 @@ if(isset($_POST['action'])) {
             $apiStatuses[] = array(
                 'key'     => (string)$key,
                 'name'    => $cfg['name'],
-                'enabled' => (isset($conf[$enableKey]) && $conf[$enableKey] == '1'),
+                'enabled' => api_config_enabled($conf, (string)$key),
             );
         }
 

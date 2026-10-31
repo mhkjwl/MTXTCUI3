@@ -223,7 +223,12 @@ if(isset($_POST['action'])) {
             if(!preg_match('/^api_[a-zA-Z0-9_]+$/', $name)) continue;
             if(in_array($name, $sensitiveFields)) continue;
             // 敏感凭据（Cookie/Token/Key/Secret/authId/SID）加密存储，ct_encrypt 幂等（已加密不重复加密）
-            if(is_string($value) && $value !== '' && preg_match('/^api_.+_(cookie|token|key|secret|authid|sid|pwd|pass|password)$/i', $name)) {
+            $isCredentialName = (bool)preg_match('/^api_.+_(cookie|token|key|secret|authid|sid|pwd|pass|password)$/i', $name);
+            if($isCredentialName) {
+                if(!is_string($value)) continue;
+                $trimmed = trim($value);
+                // 留空或占位符 → 保持数据库中的原值（页面已不回显明文，避免误清空凭据）
+                if($trimmed === '' || $trimmed === '__KEEP_EXISTING__') continue;
                 $value = ct_encrypt($value);
             }
             $ok = $DB->query_prepared("INSERT INTO eecms_config SET `name`=?, `main`=? ON DUPLICATE KEY UPDATE `main`=?", 'sss', [$name, $value, $value]);
@@ -286,8 +291,7 @@ if(isset($_POST['action'])) {
             exit;
         }
         // M10 修复：禁止将已禁用的接口设为默认，否则前台用户上传会走不可用接口
-        $enableVal = isset($conf['api_'.$key.'_enable']) ? $conf['api_'.$key.'_enable'] : '0';
-        if($enableVal !== '1') {
+        if(!api_config_enabled($conf, (string)$key)) {
             echo json_encode(['code'=>1, 'msg'=>'该接口当前已禁用，请先启用再设为默认']);
             exit;
         }
@@ -378,6 +382,8 @@ if(isset($_POST['action'])) {
 }
 
 // ========== 构建接口当前值（输出到前端，用于回显编辑表单）==========
+// 安全：Cookie/Token/Key/Secret 等凭据不再输出明文，仅输出"是否已配置"标记；
+// 前端密码框留空表示保持原值（保存时后端同样跳过空值）
 $apiValues = array();
 foreach($apiInterfaces as $key=>$cfg) {
     $vals = array();
@@ -385,7 +391,14 @@ foreach($apiInterfaces as $key=>$cfg) {
     $vals['alias']  = isset($conf['api_'.$key.'_alias']) ? $conf['api_'.$key.'_alias'] : '';
     $vals['maxsize']= isset($conf['api_'.$key.'_maxsize']) ? $conf['api_'.$key.'_maxsize'] : '';
     foreach($cfg['fields'] as $f) {
-        $vals[$f['name']] = isset($conf['api_'.$key.'_'.$f['name']]) ? $conf['api_'.$key.'_'.$f['name']] : (isset($f['default']) ? $f['default'] : '');
+        $rawValue = isset($conf['api_'.$key.'_'.$f['name']]) ? $conf['api_'.$key.'_'.$f['name']] : (isset($f['default']) ? $f['default'] : '');
+        $isSensitiveField = (bool)preg_match('/(^|_)(cookie|token|key|secret|authid|sid|pwd|pass|password)$/i', $f['name']);
+        if($isSensitiveField) {
+            $vals[$f['name']] = ($rawValue === '') ? '' : '__KEEP_EXISTING__';
+            $vals['_has_'.$f['name']] = ($rawValue !== '');
+        } else {
+            $vals[$f['name']] = $rawValue;
+        }
     }
     $apiValues[$key] = $vals;
 }
@@ -455,9 +468,12 @@ html,body{height:100%;margin:0}body{overflow:auto}.admin-content{padding:16px 28
   <div class="default-bar">
     <span class="default-label"><?php echo icon('check-circle'); ?> 默认图床接口</span>
     <select id="defaultApiSelect" class="form-select">
-      <?php foreach($apiInterfaces as $key=>$cfg): ?>
+      <?php foreach($apiInterfaces as $key=>$cfg){
+        // 只列出当前已启用的接口，以及当前默认接口本身（避免选中禁用项后才报错）
+        if($key !== $api_default && !api_config_enabled($conf, (string)$key)) continue;
+      ?>
         <option value="<?php echo htmlspecialchars((string)$key, ENT_QUOTES); ?>" <?php echo ($api_default==$key)?'selected':''; ?>><?php echo htmlspecialchars((string)$cfg['name'], ENT_QUOTES); ?></option>
-      <?php endforeach; ?>
+      <?php } ?>
     </select>
     <button type="button" class="btn btn-primary btn-sm" onclick="saveDefault()"><?php echo icon('content-save'); ?> 设为默认</button>
     <span style="font-size:12px;color:#64748b;">前台图床上传默认使用的 API 接口</span>
@@ -801,11 +817,13 @@ function openEdit(key){
             var col = f.col || 12;
             var fname = 'api_'+key+'_'+f.name;
             var val = v[f.name] !== undefined ? v[f.name] : '';
-            var required = f.required ? '<span class="api-required">*</span> ' : '';
+            var hasSaved = (v['_has_'+f.name] === true);
+            var ph = hasSaved ? '已配置，留空则不修改' : escHtml(f.placeholder||'');
+            var required = (f.required && !hasSaved) ? '<span class="api-required">*</span> ' : '';
             html += '<div class="col-md-'+col+' mb-3">';
             html += '<label class="form-label">'+required+escHtml(f.label)+'</label>';
             if(f.type === 'textarea'){
-                html += '<textarea class="form-control" name="'+fname+'" placeholder="'+escHtml(f.placeholder||'')+'" style="height:'+(f.height||100)+'px;">'+escHtml(val)+'</textarea>';
+                html += '<textarea class="form-control" name="'+fname+'" placeholder="'+ph+'" style="height:'+(f.height||100)+'px;">'+escHtml(hasSaved ? '' : val)+'</textarea>';
             } else if(f.type === 'select'){
                 html += '<select class="form-select" name="'+fname+'">';
                 var opts = f.options || {};
@@ -819,7 +837,8 @@ function openEdit(key){
                 html += '<input type="text" class="form-control" value="'+escHtml(f.disabled)+'" disabled>';
             } else {
                 var inputType = (f.type === 'password') ? 'password' : 'text';
-                html += '<input type="'+inputType+'" class="form-control" name="'+fname+'" value="'+escHtml(val)+'" placeholder="'+escHtml(f.placeholder||'')+'">';
+                var inputVal = (f.type === 'password' && hasSaved) ? '' : val;
+                html += '<input type="'+inputType+'" class="form-control" name="'+fname+'" value="'+escHtml(inputVal)+'" placeholder="'+ph+'"'+(f.type === 'password' ? ' autocomplete="new-password"' : '')+'>';
             }
             html += '</div>';
         });
@@ -927,11 +946,18 @@ function saveEdit(){
                     var v = API_VALUES[key] || {};
                     formData.forEach(function(item){
                         var m = item.name.match(/^api_[a-zA-Z0-9]+_(.*)$/);
-                        if(m){
-                            if(m[1]==='enable') v.enable = item.value;
-                            else if(m[1]==='alias') v.alias = item.value;
-                            else if(m[1]==='maxsize') v.maxsize = item.value;
-                            else v[m[1]] = item.value;
+                        if(!m) return;
+                        var fieldName = m[1];
+                        var $el = $('#editForm [name="'+item.name+'"]');
+                        var isSecretInput = ($el.attr('type') === 'password' || $el.is('textarea'));
+                        // 密码框/文本域留空 = 保持原值（服务端同样跳过），不要用空值覆盖内存中的“已配置”状态
+                        if(isSecretInput && item.value === '') return;
+                        if(fieldName==='enable') v.enable = item.value;
+                        else if(fieldName==='alias') v.alias = item.value;
+                        else if(fieldName==='maxsize') v.maxsize = item.value;
+                        else {
+                            v[fieldName] = item.value;
+                            v['_has_'+fieldName] = (item.value !== '');
                         }
                     });
                     API_VALUES[key] = v;

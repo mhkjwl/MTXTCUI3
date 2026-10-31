@@ -129,8 +129,16 @@ if(isset($_POST['action'])) {
             if(!$grp) json_exit(1, '所选接口分组不存在');
         }
 
-        $exists = pkg_safe_get_row_prepared($DB, "SELECT id FROM eecms_packages WHERE id=? AND status=1", 'i', [$id]);
+        $exists = pkg_safe_get_row_prepared($DB, "SELECT id, is_default FROM eecms_packages WHERE id=? AND status=1", 'i', [$id]);
         if(!$exists) json_exit(1, '套餐不存在');
+
+        // 不允许取消"最后一个默认套餐"，否则新用户注册后没有任何默认配额
+        if($isDefault === 0 && (int)$exists['is_default'] === 1) {
+            $otherDefault = pkg_safe_count_prepared($DB, "SELECT COUNT(*) FROM eecms_packages WHERE is_default=1 AND status=1 AND id<>?", 'i', [$id]);
+            if($otherDefault <= 0) {
+                json_exit(1, '系统必须保留至少一个默认套餐，请先把其他套餐设为默认');
+            }
+        }
 
         // level 唯一性校验（M3 修复：排除自身且仅检查启用记录）
         $dup = pkg_safe_get_row_prepared($DB, "SELECT id FROM eecms_packages WHERE level=? AND id != ? AND status=1", 'ii', [$level, $id]);

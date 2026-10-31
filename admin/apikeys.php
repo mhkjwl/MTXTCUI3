@@ -42,6 +42,15 @@ if(isset($_POST['action'])) {
         if($username !== '') $filters['username'] = $username;
         if($status !== '' && $status !== null) $filters['status'] = (int)$status;
 
+        // 分页：先统计总数，再按 limit/offset 取当前页（原先一次性返回全表）
+        $page     = max(1, (int)($_POST['page'] ?? 1));
+        $perPage  = 20;
+        $total    = api_key_count_all($DB, $filters);
+        $totalPages = max(1, (int)ceil($total / $perPage));
+        if($page > $totalPages) $page = $totalPages;
+        $filters['limit']  = $perPage;
+        $filters['offset'] = ($page - 1) * $perPage;
+
         $rows = api_key_list_all($DB, $filters);
         $list = [];
         foreach($rows as $r) {
@@ -56,7 +65,13 @@ if(isset($_POST['action'])) {
                 'created_at'   => $r['created_at'],
             ];
         }
-        ak_json(0, 'ok', ['list' => $list, 'total' => count($list)]);
+        ak_json(0, 'ok', [
+            'list'       => $list,
+            'total'      => $total,
+            'page'       => $page,
+            'totalPages' => $totalPages,
+            'perPage'    => $perPage,
+        ]);
     }
 
     // L4 修复：移除 detail 死代码接口（前端已无调用，硬约束要求"无查看按钮"）
@@ -174,7 +189,7 @@ $csrfToken = csrf_token();
         </div>
         <div class="col-md-2">
           <label class="form-label">&nbsp;</label>
-          <button type="button" class="btn btn-primary w-100" onclick="loadList()"><?php echo icon('magnify'); ?> 搜索</button>
+          <button type="button" class="btn btn-primary w-100" onclick="loadList(1)"><?php echo icon('magnify'); ?> 搜索</button>
         </div>
         <div class="col-md-2">
           <label class="form-label">&nbsp;</label>
@@ -210,6 +225,7 @@ $csrfToken = csrf_token();
           </tbody>
         </table>
       </div>
+      <div id="akPagination" class="d-flex justify-content-center py-2"></div>
     </div>
   </div>
 
@@ -255,16 +271,21 @@ $.ajaxSetup({
 });
 
 var currentPlainKey = '';
+var _akPage = 1;
 
-// 加载密钥列表
-function loadList(){
+// 加载密钥列表（page 省略时保持当前页）
+function loadList(page){
+    if(typeof page === 'number' && page > 0) _akPage = page;
+    var pageNo = _akPage;
     var u = $.trim($('#fUsername').val());
     var s = $('#fStatus').val();
     $('#akTableBody').html('<tr><td colspan="8" class="text-center text-muted py-5">'+eeIcon('loading','icon-spin')+' 加载中...</td></tr>');
-    $.post('apikeys.php', {action:'list', username:u, status:s}, function(res){
+    $.post('apikeys.php', {action:'list', username:u, status:s, page:pageNo}, function(res){
         if(res.code !== 0){ Swal.fire('错误', res.msg, 'error'); return; }
         var list = res.data.list || [];
-        $('#totalCount').text(list.length);
+        _akPage = res.data.page || 1;
+        $('#totalCount').text(res.data.total || 0);
+        renderAkPagination(res.data);
         if(list.length === 0){
             $('#akTableBody').html('<tr><td colspan="8" class="text-center text-muted py-5">'+eeIcon('key-remove')+' 暂无密钥</td></tr>');
             return;
@@ -297,7 +318,33 @@ function loadList(){
 }
 
 function resetFilter(){
-    $('#fUsername').val(''); $('#fStatus').val(''); loadList();
+    $('#fUsername').val(''); $('#fStatus').val(''); loadList(1);
+}
+
+// 渲染分页（点击通过事件委托绑定）
+function renderAkPagination(data){
+    var box = $('#akPagination');
+    box.empty();
+    var totalPages = data.totalPages || 1;
+    var page = data.page || 1;
+    if(totalPages <= 1) return;
+    var ul = $('<ul class="pagination pagination-sm mb-0"></ul>');
+    ul.append('<li class="page-item '+(page<=1?'disabled':'')+'"><a class="page-link" href="javascript:void(0)" data-page="'+(page-1)+'">上一页</a></li>');
+    var start = Math.max(1, page - 2);
+    var end = Math.min(totalPages, page + 2);
+    if(start > 1){
+        ul.append('<li class="page-item"><a class="page-link" href="javascript:void(0)" data-page="1">1</a></li>');
+        if(start > 2) ul.append('<li class="page-item disabled"><span class="page-link">...</span></li>');
+    }
+    for(var p = start; p <= end; p++){
+        ul.append('<li class="page-item '+(p===page?'active':'')+'"><a class="page-link" href="javascript:void(0)" data-page="'+p+'">'+p+'</a></li>');
+    }
+    if(end < totalPages){
+        if(end < totalPages - 1) ul.append('<li class="page-item disabled"><span class="page-link">...</span></li>');
+        ul.append('<li class="page-item"><a class="page-link" href="javascript:void(0)" data-page="'+totalPages+'">'+totalPages+'</a></li>');
+    }
+    ul.append('<li class="page-item '+(page>=totalPages?'disabled':'')+'"><a class="page-link" href="javascript:void(0)" data-page="'+(page+1)+'">下一页</a></li>');
+    box.append(ul);
 }
 
 // 重新生成（二次确认 → 全局通知 → 明文仅展示一次 → 局部刷新）
@@ -387,7 +434,14 @@ function escapeHtml(s){
     });
 }
 
-$(function(){ loadList(); });
+$(function(){
+    // 分页点击（事件委托）
+    $('#akPagination').on('click', 'a.page-link', function(){
+        var p = parseInt($(this).attr('data-page'), 10);
+        if(!isNaN(p) && p > 0) loadList(p);
+    });
+    loadList(1);
+});
 </script>
 </body>
 </html>

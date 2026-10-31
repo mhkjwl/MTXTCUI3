@@ -460,6 +460,28 @@ function ct_decrypt($ciphertext) {
  *
  * @return array<string, array{name: string, max_size: float}>
  */
+/**
+ * 图床接口默认启用状态（与 admin/api.php 的 default_enable 保持一致）
+ * @param string $key 接口标识
+ * @return string '1'=默认启用 '0'=默认禁用
+ */
+function api_default_enable($key) {
+	return $key === 'local' ? '1' : '0';
+}
+
+/**
+ * 判断图床接口当前是否启用：配置缺失时回退到接口默认启用状态，
+ * 供后台仪表盘、接口分组、权限校验等统一使用，避免各处判定口径不一致
+ * @param array  $conf 全局配置
+ * @param string $key  接口标识
+ * @return bool
+ */
+function api_config_enabled($conf, $key) {
+	$cfgKey = 'api_' . $key . '_enable';
+	if(isset($conf[$cfgKey])) return $conf[$cfgKey] == '1';
+	return api_default_enable($key) === '1';
+}
+
 function get_api_config() {
 	return [
 		'cfbed'      => ['name' => '自建图床',       'max_size' => 100],

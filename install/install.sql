@@ -27,11 +27,8 @@ INSERT INTO `eecms_config` VALUES ('email', '');
 -- 默认 API（本地上传，无需第三方依赖）
 INSERT INTO `eecms_config` VALUES ('api_default', 'local');
 
--- 邮件
-INSERT INTO `eecms_config` VALUES ('mail_name', '');
-INSERT INTO `eecms_config` VALUES ('mail_stmp', '');
-INSERT INTO `eecms_config` VALUES ('mail_port', '465');
-INSERT INTO `eecms_config` VALUES ('mail_pwd', '');
+-- 邮件：SMTP 配置项（smtp_*）在下方「SMTP 邮件配置」区块预置，
+-- 旧版 mail_* 键已无任何代码引用，不再预置
 
 -- ========== 图床配置 ==========
 INSERT INTO `eecms_config` VALUES ('api_360_enable', '0');
@@ -322,6 +319,7 @@ CREATE TABLE IF NOT EXISTS `eecms_users` (
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `last_login` datetime DEFAULT NULL,
   `upload_count` int(11) NOT NULL DEFAULT 0,
+  `session_version` int(11) NOT NULL DEFAULT 0,
   PRIMARY KEY (`id`),
   UNIQUE KEY `username` (`username`),
   KEY `idx_email` (`email`)

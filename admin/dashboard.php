@@ -81,7 +81,7 @@ $enabledCount = 0;
 $disabledCount = 0;
 
 foreach ($apiList as &$api) {
-    $isEnabled = empty($api['enable']) ? true : (isset($conf[$api['enable']]) && $conf[$api['enable']] == '1');
+    $isEnabled = empty($api['enable']) ? true : api_config_enabled($conf, $api['key']);
     $api['enabled'] = $isEnabled;
     if ($isEnabled) {
         $enabledCount++;
@@ -91,7 +91,7 @@ foreach ($apiList as &$api) {
 }
 unset($api);
 
-$defaultApi = isset($conf['api_default']) ? $conf['api_default'] : '360';
+$defaultApi = isset($conf['api_default']) ? $conf['api_default'] : 'local';
 $defaultName = '未知';
 foreach ($apiList as $api) {
     if ($api['key'] === $defaultApi) {

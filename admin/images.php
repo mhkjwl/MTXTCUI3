@@ -693,6 +693,7 @@ function deleteImage(id, filename){
                 success: function(res){
                     if(res.code === 0){
                         toast('success', res.msg);
+                        loadGlobalStats(); // 单张删除同样刷新统计卡片
                         loadImages(_currentPage);
                     } else {
                         toast('error', res.msg);

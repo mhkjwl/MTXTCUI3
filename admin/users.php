@@ -84,6 +84,16 @@ if(isset($_POST['action'])) {
             }
         }
         $users = [];
+        // 批量统计本页用户的密钥数量，避免逐行查询（原实现为 N+1）
+        $uidList = [];
+        foreach($userRows as $r) { $uidList[] = (int)$r['id']; }
+        $keyCounts = [];
+        if(!empty($uidList)) {
+            $uidPh    = implode(',', array_fill(0, count($uidList), '?'));
+            $uidTypes = str_repeat('i', count($uidList));
+            $cntRows  = pkg_safe_get_all_prepared($DB, "SELECT user_id, COUNT(*) AS c FROM api_keys WHERE user_id IN ($uidPh) GROUP BY user_id", $uidTypes, $uidList);
+            foreach($cntRows as $cr) { $keyCounts[(int)$cr['user_id']] = (int)$cr['c']; }
+        }
         $nowDate = date('Y-m-d H:i:s');
         foreach($userRows as $row) {
             $subExpire = $row['sub_expire_time'];
@@ -105,7 +115,7 @@ if(isset($_POST['action'])) {
                 'expire_time'   => $subExpire,
                 'is_expired'    => $isExpired,
                 'is_permanent'  => ($subExpire !== null && substr((string)$subExpire, 0, 4) >= '2099'),
-                'api_key_count' => api_key_count_by_user($DB, (int)$row['id']),
+                'api_key_count' => isset($keyCounts[(int)$row['id']]) ? $keyCounts[(int)$row['id']] : 0,
             ];
         }
         json_exit(0, 'ok', [
@@ -178,17 +188,32 @@ if(isset($_POST['action'])) {
         if(strlen($password) < 6) json_exit(1, '密码长度至少6位');
         if(strlen($password) > 64) json_exit(1, '密码长度不能超过64位');
 
-        $exists = pkg_safe_get_row_prepared($DB, "SELECT id FROM eecms_users WHERE id=?", 'i', [$id]);
-        if(!$exists) json_exit(1, '用户不存在');
+        $target = pkg_safe_get_row_prepared($DB, "SELECT id, username FROM eecms_users WHERE id=?", 'i', [$id]);
+        if(!$target) json_exit(1, '用户不存在');
 
         $hash = password_hash($password, PASSWORD_DEFAULT);
-        // L10: 重置密码时使该用户的所有会话令牌失效
-        invalidate_user_sessions($id);
+        $isBuiltinAdmin = ($target['username'] === $currentAdminUser);
+        // 内置管理员的登录密码存在 eecms_config.admin_pwd，必须同步，否则后台登录密码不会改变
+        if($isBuiltinAdmin) {
+            $oldCfgPwd = isset($conf['admin_pwd']) ? (string)$conf['admin_pwd'] : '';
+            if($DB->query_prepared("UPDATE eecms_config SET `main`=? WHERE `name`='admin_pwd'", 's', [$hash]) === false) {
+                json_exit(1, '管理员登录密码重置失败，请重试！');
+            }
+        }
         if($DB->query_prepared("UPDATE eecms_users SET password=? WHERE id=?", 'si', [$hash, $id]) === false) {
+            if($isBuiltinAdmin && isset($oldCfgPwd)) {
+                $DB->query_prepared("UPDATE eecms_config SET `main`=? WHERE `name`='admin_pwd'", 's', [$oldCfgPwd]);
+            }
             json_exit(1, '密码重置失败，请重试！');
         }
+        // L10: 重置密码时使该用户的所有会话令牌失效
+        invalidate_user_sessions($id);
         // H14 修复：补充审计日志
-        log_admin_action($DB, 'user_reset_password', 'user', $id, []);
+        log_admin_action($DB, 'user_reset_password', 'user', $id, ['builtin_admin' => $isBuiltinAdmin]);
+        if($isBuiltinAdmin) {
+            // 内置管理员的会话令牌由 admin_pwd 参与计算，改密后当前登录态已失效，提示重新登录
+            json_exit(0, '密码已重置，请使用新密码重新登录后台', ['need_logout' => true]);
+        }
         json_exit(0, '密码重置成功');
     }
 
@@ -443,23 +468,20 @@ if(isset($_POST['action'])) {
 
         $sub = get_user_subscription($DB, $id);
         if(!$sub) {
-            // 无订阅记录，先创建一条默认订阅
-            $defaultPkg = get_default_package($DB);
-            if(!$defaultPkg) json_exit(1, '系统未配置默认套餐');
-            $now = date('Y-m-d H:i:s');
+            // 无订阅记录：仅开启自定义配额时才建订阅；以默认套餐为基准并设为永久，
+            // 避免写成 expire_time=now 的“生成即过期”记录
             if($enabled == 1) {
-                $DB->query_prepared(
-                    "INSERT INTO eecms_user_subs (user_id, package_id, package_level, package_name, expire_time, custom_storage) VALUES (?, ?, ?, ?, ?, ?)",
-                    'iiissi',
-                    [$id, (int)$defaultPkg['id'], (int)$defaultPkg['level'], $defaultPkg['name'], $now, $bytes]
+                $defaultPkg = get_default_package($DB);
+                if(!$defaultPkg) json_exit(1, '系统未配置默认套餐');
+                $expireTime = defined('PKG_PERMANENT_EXPIRE') ? PKG_PERMANENT_EXPIRE : '2099-12-31 23:59:59';
+                $inserted = $DB->query_prepared(
+                    "INSERT INTO eecms_user_subs (user_id, package_id, package_level, package_name, expire_time, custom_storage) VALUES (?, ?, 0, ?, ?, ?)",
+                    'iissi',
+                    [$id, (int)$defaultPkg['id'], $defaultPkg['name'], $expireTime, $bytes]
                 );
-            } else {
-                $DB->query_prepared(
-                    "INSERT INTO eecms_user_subs (user_id, package_id, package_level, package_name, expire_time, custom_storage) VALUES (?, ?, ?, ?, ?, NULL)",
-                    'iiiss',
-                    [$id, (int)$defaultPkg['id'], (int)$defaultPkg['level'], $defaultPkg['name'], $now]
-                );
+                if($inserted === false) json_exit(1, '自定义存储保存失败，请重试');
             }
+            // 关闭自定义配额且本就没有订阅：无需写库
         } else {
             if($enabled == 1) {
                 pkg_safe_query_prepared($DB, "UPDATE eecms_user_subs SET custom_storage=? WHERE user_id=?", 'ii', [$storageSql, $id]);
@@ -633,11 +655,12 @@ if(isset($_POST['action'])) {
           </div>
           <div class="row g-2">
             <div class="col-md-6 mb-3">
-              <label class="form-label">角色</label>
+              <label class="form-label">用户中心角色</label>
               <select class="form-select" id="editRole">
                 <option value="user">普通用户</option>
                 <option value="super_admin">超级管理员</option>
               </select>
+              <small class="text-muted d-block mt-1">仅影响用户中心权限（可管理全站图片），<b>不等于后台登录权限</b>；后台登录账号请在「修改信息」中维护。</small>
             </div>
             <div class="col-md-6 mb-3">
               <label class="form-label">状态</label>
@@ -1212,6 +1235,17 @@ function saveResetPwd(){
             success: function(res){
                 if(res.code === 0){
                     resetPwdModal.hide();
+                    if(res.data && res.data.need_logout){
+                        Swal.fire({
+                            title: '密码已重置',
+                            text: res.msg || '请使用新密码重新登录后台',
+                            icon: 'success',
+                            confirmButtonText: '重新登录',
+                            allowOutsideClick: false,
+                            allowEscapeKey: false
+                        }).then(function(){ top.location.href = 'login.php'; });
+                        return;
+                    }
                     toast('success', res.msg);
                     loadUsers(_currentPage);
                 } else {

@@ -62,7 +62,11 @@ if(isset($_POST['action'])) {
         //         原黑名单只拦截 used/all，任意其他值会落入 redeem_build_where 的兜底分支
         //         返回全部记录（含已使用兑换码明文），导致 H17 防护被绕过
         if(!in_array($filter, ['unused', 'expired'], true)) {
-            $filter = 'unused';
+            // 不再静默改写筛选条件，明确告知前端只支持这两种导出范围
+            header('Content-Type: text/plain; charset=utf-8');
+            http_response_code(400);
+            echo '仅支持导出「未使用」或「已过期」的兑换码，请先切换筛选条件';
+            exit;
         }
         $w       = redeem_build_where($DB, $filter, $batchNo);
 
@@ -229,7 +233,8 @@ if(isset($_POST['action'])) {
         log_admin_action($DB, 'redeem_delete_selected', 'redeem_code', 0, ['count' => $affected, 'code_prefixes' => $codeSummary]);
         $skipped = count($intIds) - $affected;
         $msg = "已删除 {$affected} 个未使用的兑换码";
-        if($skipped > 0) $msg .= "（跳过 {$skipped} 个已使用/已过期的）";
+        // 过期但未使用的兑换码属于可删除范围，跳过项只可能是"已使用"
+        if($skipped > 0) $msg .= "（跳过 {$skipped} 个已使用的）";
         json_exit(0, $msg, ['count' => $affected, 'skipped' => $skipped]);
     }
 
@@ -1005,11 +1010,17 @@ function exportGeneratedCodes(){
 
 // ============ 导出（按当前筛选） ============
 function exportCodes(){
+    var filter = $('#filterSelect').val();
+    // 与服务端白名单保持一致：仅允许导出未使用/已过期，避免"筛选全部但只导出未使用"的误解
+    if(filter !== 'unused' && filter !== 'expired'){
+        toast('warning', '仅支持导出「未使用」或「已过期」的兑换码，请先切换筛选条件', 4000);
+        return;
+    }
     $.ajax({
         url:'redeem.php', type:'POST', dataType:'text',
         data:{
             action:'export',
-            filter:$('#filterSelect').val(),
+            filter:filter,
             batch_no:$('#batchInput').val().trim()
         },
         success:function(text){

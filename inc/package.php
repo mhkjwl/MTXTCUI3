@@ -681,6 +681,10 @@ function is_s3_config_enabled($conf, $s3Id) {
  * @return bool
  */
 function is_api_enabled($conf, $apiKey) {
+    // 统一口径：配置缺失时回退到接口默认启用状态（function.php: api_config_enabled）
+    if(function_exists('api_config_enabled')) {
+        return api_config_enabled($conf, $apiKey);
+    }
     $enableKey = 'api_' . $apiKey . '_enable';
     return isset($conf[$enableKey]) && $conf[$enableKey] == '1';
 }
