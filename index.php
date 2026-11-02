@@ -61,27 +61,15 @@ declare(strict_types=1);
     // 登录状态（来自 member.php，通过 common.php 加载）
     $isLoggedIn = isset($islogin) && $islogin == 1;
 
-    // ========== 访客预览模式（管理员后台登录时生效） ==========
-    // 设计意图：管理员从后台登录后访问前端时，应以访客身份呈现访问控制，
-    // 便于直接验证「访问控制」页配置的访客分组、强制隐藏本地上传等设置是否生效。
-    // 实现要点：管理员后台登录状态 ($isLoggedIn) 优先于用户中心登录状态 ($isUserLoggedIn)，
-    // 仅作用于前端 index.php 的访问控制与 UI 呈现，不影响用户中心 (user/) 的真实登录态。
-    // 历史问题：此前仅判断 $isUserLoggedIn，若管理员同时登录了用户中心（如 admin1），
-    // 则 $isUserLoggedIn=true 会覆盖访客视图，导致无法在前端验证访客权限配置，表现为
-    // 「强制隐藏访客本地上传」开关不生效。
-    $isAdminPreviewGuest = false;
-    if($isLoggedIn) {
-        $isAdminPreviewGuest = true;
-        // 覆盖为访客身份，使后续 forceHideLocal / 套餐过滤 / UI 均按访客呈现
-        $isUserLoggedIn = false;
-        $currentUserId   = 0;
-        $currentUser     = null;
-        $currentUserRole = 'guest';
-    }
+    // ========== 访客预览模式（仅“管理员单独登录、未登录用户中心”时生效） ==========
+    // 设计意图：管理员只登录后台时，访问前端默认按访客呈现，便于验证访问控制配置。
+    // 但后台与用户中心是两套独立登录态：若管理员同时登录了用户中心，
+    // 前端应以用户身份呈现，不能再被后台登录态覆盖（两者可同时在线）。
+    $isAdminPreviewGuest = $isLoggedIn && !$isUserLoggedIn;
 
     // ========== 套餐接口过滤 ==========
-    // 前端访问控制基于用户中心登录状态（$isUserLoggedIn）。
-    // 管理员后台登录时 $isUserLoggedIn 已被上方覆盖为 false，因此会按访客权限呈现。
+    // 前端访问控制基于用户中心登录状态（$isUserLoggedIn）；
+    // 后台登录态不再覆盖它，仅影响 $isAdminPreviewGuest。
     $pkgUserId = 0;
     if($isUserLoggedIn) {
         $pkgUserId = (int)$currentUserId;
@@ -98,14 +86,14 @@ declare(strict_types=1);
     }
 
     // 未登录用户强制隐藏本地上传
-    // 注意：管理员后台登录时 $isUserLoggedIn 已在上方被覆盖为 false，
-    // 因此 forceHideLocal 也会对管理员预览模式生效，可直观验证开关效果。
+    // 管理员只登录后台时 $isAdminPreviewGuest=true、$isUserLoggedIn=false，
+    // 因此访客预览模式同样会应用该开关；同时登录用户中心后按真实用户身份判断。
     $guestHideLocal = isset($conf['guest_hide_local']) ? $conf['guest_hide_local'] : '0';
     $forceHideLocal = !$isUserLoggedIn && $guestHideLocal === '1';
 
     // 上传需要登录：后台开启 upload_require_login 且用户未登录时，
     // 上传按钮显示「登录后开始上传」并跳转登录页，而非触发上传。
-    // 注意：管理员预览模式下 $isUserLoggedIn 已被覆盖为 false，因此也会按访客呈现。
+    // 管理员仅登录后台（未登录用户中心）时同样按访客处理。
     $uploadRequireLogin = isset($conf['upload_require_login']) ? $conf['upload_require_login'] : '0';
     $needLoginToUpload = ($uploadRequireLogin === '1') && !$isUserLoggedIn;
 

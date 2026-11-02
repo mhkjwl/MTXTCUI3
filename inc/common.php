@@ -40,6 +40,21 @@ $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
            (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == '443') ||
            (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https'
             && isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == '443');
+// 后台与用户中心使用独立 PHP 会话：
+// 两边各自登录时会 session_regenerate_id(true)，若共用 PHPSESSID，会销毁对方会话，
+// 导致另一端的 CSRF token 立即失效（表现为“后台登录后前端登录不上”，反之亦然）。
+// 身份本身由独立的 admin_token / user_token Cookie 承载，这里只隔离会话命名空间。
+$__reqPath = '';
+if(isset($_SERVER['REQUEST_URI'])) {
+    $__reqPath = (string)parse_url((string)$_SERVER['REQUEST_URI'], PHP_URL_PATH);
+}
+if($__reqPath === '' && isset($_SERVER['SCRIPT_NAME'])) {
+    $__reqPath = str_replace('\\', '/', (string)$_SERVER['SCRIPT_NAME']);
+}
+$__isAdminArea = (bool)preg_match('#(^|/)admin(/|$)#i', $__reqPath);
+session_name($__isAdminArea ? 'MTXTCADMINSESS' : 'MTXTCUSERSESS');
+unset($__reqPath, $__isAdminArea);
+
 session_set_cookie_params([
     'lifetime' => 0,
     'path'     => '/',
