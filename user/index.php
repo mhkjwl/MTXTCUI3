@@ -830,7 +830,7 @@ if(!$isSuperAdmin) {
         </div>
         <p style="font-size:0.88rem;color:var(--muted);margin-bottom:14px;line-height:1.6;">
           <i class="mdi mdi-information-outline"></i> 用于对外 API 上传，请求头携带 <code style="background:var(--surface-2);padding:2px 6px;border-radius:4px;font-family:var(--font-mono);color:var(--primary);">Authorization: Bearer sk-xxx</code> 即可鉴权。
-          <span style="color:var(--warning);font-weight:600;">明文仅在生成/重置时展示一次，请立即复制保存。</span>
+          <span style="color:var(--warning);font-weight:600;">明文仅在生成/重置时展示一次；之后可在列表中点击复制，但不会再显示明文。</span>
         </p>
         <div id="akListContainer">
           <div style="text-align:center;padding:32px;color:var(--muted);"><i class="mdi mdi-loading mdi-spin"></i> 加载中...</div>
@@ -934,7 +934,7 @@ if(!$isSuperAdmin) {
           <input type="text" id="akKeyName" placeholder="如：CLI 上传工具 / 个人博客" maxlength="100" required>
         </div>
         <p style="font-size:0.84rem;color:var(--muted);margin-top:8px;">
-          <i class="mdi mdi-alert-circle-outline"></i> 名称用于区分不同用途的密钥，最多 100 字符。生成后明文仅展示一次。
+          <i class="mdi mdi-alert-circle-outline"></i> 名称用于区分不同用途的密钥，最多 100 字符。生成后明文仅展示一次，之后可点击列表中的复制按钮获取。
         </p>
       </div>
       <div class="modal-actions">
@@ -950,7 +950,7 @@ if(!$isSuperAdmin) {
       <h3 class="modal-title" style="color:var(--warning);"><i class="mdi mdi-alert"></i> 密钥已生成（仅展示一次）</h3>
       <div class="modal-body">
         <p style="color:var(--danger);font-size:0.88rem;margin-bottom:10px;">
-          <i class="mdi mdi-alert-circle"></i> 请立即复制保存，关闭后将无法再次查看！
+          <i class="mdi mdi-alert-circle"></i> 请立即复制保存；关闭后不再显示明文，可在列表中点击复制。
         </p>
         <div id="akPlainBox" class="ak-plain-key"></div>
         <p style="font-size:0.84rem;color:var(--muted);margin-top:8px;">前缀：<span id="akPlainPrefix" style="font-family:var(--font-mono);color:var(--primary);font-weight:600;"></span></p>
@@ -2116,6 +2116,7 @@ function akRenderList(list){
       + '</div>'
       + stHtml
       + '<div class="ak-actions">'
+      + '  <button onclick="akCopyExisting('+k.id+')" title="复制密钥"><i class="mdi mdi-content-copy"></i></button>'
       + '  <button onclick="akRegen('+k.id+')" title="重新生成"><i class="mdi mdi-refresh"></i></button>'
       + '  <button onclick="akToggle('+k.id+','+k.status+')" title="'+toggleTitle+'"><i class="mdi '+toggleIcon+'"></i></button>'
       + '  <button class="danger" onclick="akDelete('+k.id+')" title="删除"><i class="mdi mdi-delete"></i></button>'
@@ -2173,8 +2174,44 @@ document.getElementById('akPlainClose').addEventListener('click', function(){
   akHideOverlay('plainKeyOverlay');
 });
 
+// 复制已有密钥：向服务端请求明文后直接写入剪贴板，不在页面中展示
+function akCopyFallback(text){
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch(e) {}
+  document.body.removeChild(ta);
+  return ok;
+}
+function akCopyExisting(id){
+  var fd = new FormData();
+  fd.append('csrf_token', csrfToken);
+  fd.append('id', id);
+  fetch('../api/api_keys.php?action=copy', {method:'POST', body:fd})
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if(res.code !== 0){ notify(res.msg || '复制失败', 'warning'); return; }
+      var text = res.api_key || '';
+      if(navigator.clipboard && window.isSecureContext){
+        navigator.clipboard.writeText(text).then(function(){
+          notify('密钥已复制到剪贴板', 'success');
+        }).catch(function(){
+          var ok = akCopyFallback(text);
+          notify(ok ? '密钥已复制到剪贴板' : '复制失败，请重试', ok ? 'success' : 'warning');
+        });
+      } else {
+        var ok = akCopyFallback(text);
+        notify(ok ? '密钥已复制到剪贴板' : '复制失败，请重试', ok ? 'success' : 'warning');
+      }
+    })
+    .catch(function(){ notify('网络错误', 'error'); });
+}
+
 function akRegen(id){
-  showConfirm('重新生成密钥', '旧密钥明文将立即失效，使用旧密钥的客户端需更新。新明文仅展示一次。', '确认重置').then(function(ok){
+  showConfirm('重新生成密钥', '旧密钥明文将立即失效，使用旧密钥的客户端需更新。新明文仅展示一次，之后可在列表中复制。', '确认重置').then(function(ok){
     if(!ok) return;
     var fd = new FormData();
     fd.append('csrf_token', csrfToken);

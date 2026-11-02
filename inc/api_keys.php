@@ -6,7 +6,8 @@ declare(strict_types=1);
  * @file        api_keys.php
  * @description 提供 API 密钥的建表、生成、CRUD、Bearer 鉴权等核心能力
  *              所有数据库操作均使用 mysqli 预处理（mysqli_prepare + bind_param）
- *              密钥明文仅在创建/重生成时返回一次，数据库只存 SHA-256 哈希
+ *              密钥明文仅在创建/重生成时展示一次；数据库存 SHA-256 哈希 +
+ *              ct_encrypt 加密副本（仅用于用户后续主动点击复制，列表接口不返回）
  * @author      eecms
  * @version     1.1.0-dev
  * @date        2026-08-04
@@ -28,7 +29,8 @@ function ensure_api_keys_table($DB): void {
         `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
         `user_id` INT UNSIGNED NOT NULL,
         `name` VARCHAR(100) NOT NULL COMMENT '密钥名称',
-        `key_hash` CHAR(64) NOT NULL COMMENT 'SHA-256 哈希，不存明文',
+        `key_hash` CHAR(64) NOT NULL COMMENT 'SHA-256 哈希',
+        `key_cipher` TEXT NULL COMMENT '加密后的明文（用于后续复制）',
         `key_prefix` VARCHAR(20) NOT NULL COMMENT '展示用前缀 sk-xxxxxxxx',
         `status` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '1启用 0禁用',
         `last_used_at` DATETIME DEFAULT NULL COMMENT '最后使用时间',
@@ -39,12 +41,50 @@ function ensure_api_keys_table($DB): void {
         UNIQUE KEY `uniq_key_hash` (`key_hash`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
     try { $DB->query($sql); } catch(Throwable $e) {}
+
+    // 兼容旧库：运行时补齐 key_cipher 列（幂等）
+    api_key_has_cipher_column($DB);
+}
+
+/**
+ * 检查/补齐 key_cipher 列
+ * 旧版本数据库只有 key_hash，无法再次取回明文；新增列用于保存加密副本
+ * @param object $DB
+ * @return bool 列是否可用
+ */
+function api_key_has_cipher_column($DB): bool {
+    static $has = null;
+    if($has !== null) return $has;
+
+    $has = false;
+    $rs = @$DB->query("SHOW COLUMNS FROM `api_keys` LIKE 'key_cipher'");
+    if($rs && $DB->fetch($rs)) {
+        $has = true;
+        return true;
+    }
+    try {
+        @$DB->query("ALTER TABLE `api_keys` ADD COLUMN `key_cipher` TEXT NULL COMMENT '加密后的明文（用于后续复制）' AFTER `key_hash`");
+    } catch(Throwable $e) {}
+    $rs = @$DB->query("SHOW COLUMNS FROM `api_keys` LIKE 'key_cipher'");
+    if($rs && $DB->fetch($rs)) $has = true;
+    return $has;
+}
+
+/**
+ * 加密明文密钥，仅保存可解密的副本（加密失败则不保存，避免明文落库）
+ * @param string $key
+ * @return string 空字符串表示不可保存
+ */
+function api_key_encrypt_value(string $key): string {
+    if(!function_exists('ct_encrypt')) return '';
+    $cipher = (string)ct_encrypt($key);
+    return (strpos($cipher, 'enc2:') === 0) ? $cipher : '';
 }
 
 /**
  * 生成明文 API 密钥
  * 规则：sk- + 32 位十六进制随机字符串（bin2hex(random_bytes(16))），共 35 字符
- * @return string 明文密钥（仅返回一次给客户端，DB 不存储明文）
+ * @return string 明文密钥（仅展示一次，DB 存储哈希 + 加密副本用于后续复制）
  */
 function api_key_generate(): string {
     try {
@@ -87,10 +127,17 @@ function api_key_create($DB, int $userId, string $name): array {
     $key = api_key_generate();
     $hash = api_key_hash($key);
     $prefix = api_key_prefix_from_key($key);
+    $cipher = api_key_encrypt_value($key);
 
-    $stmt = mysqli_prepare($DB->link, 'INSERT INTO api_keys (user_id, name, key_hash, key_prefix, status, created_at) VALUES (?, ?, ?, ?, 1, NOW())');
-    if($stmt === false) return [];
-    mysqli_stmt_bind_param($stmt, 'isss', $userId, $name, $hash, $prefix);
+    if(api_key_has_cipher_column($DB) && $cipher !== '') {
+        $stmt = mysqli_prepare($DB->link, 'INSERT INTO api_keys (user_id, name, key_hash, key_cipher, key_prefix, status, created_at) VALUES (?, ?, ?, ?, ?, 1, NOW())');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'issss', $userId, $name, $hash, $cipher, $prefix);
+    } else {
+        $stmt = mysqli_prepare($DB->link, 'INSERT INTO api_keys (user_id, name, key_hash, key_prefix, status, created_at) VALUES (?, ?, ?, ?, 1, NOW())');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'isss', $userId, $name, $hash, $prefix);
+    }
     $ok = mysqli_stmt_execute($stmt);
     $id = $ok ? (int)mysqli_insert_id($DB->link) : 0;
     mysqli_stmt_close($stmt);
@@ -140,6 +187,45 @@ function api_key_get_owned($DB, int $id, int $userId) {
 }
 
 /**
+ * 获取本人密钥的可复制明文（用于用户在列表中点击复制）
+ * 仅解密数据库中的加密副本，并校验哈希与副本一致；旧版仅有哈希的密钥无法取回
+ * @param object $DB
+ * @param int $id
+ * @param int $userId 所有权校验
+ * @return array ['api_key'=>明文] 或 ['error'=>错误信息]
+ */
+function api_key_get_plain($DB, int $id, int $userId): array {
+    if($id <= 0 || $userId <= 0) return ['error' => '参数无效'];
+    if(!api_key_has_cipher_column($DB)) {
+        return ['error' => '该密钥创建于旧版本，无法再次获取明文，请点击「重新生成」后再复制'];
+    }
+    if(!function_exists('ct_decrypt')) {
+        return ['error' => '服务端未启用密钥解密组件'];
+    }
+
+    $stmt = mysqli_prepare($DB->link, 'SELECT key_hash, key_cipher FROM api_keys WHERE id = ? AND user_id = ? LIMIT 1');
+    if($stmt === false) return ['error' => '查询失败，请重试'];
+    mysqli_stmt_bind_param($stmt, 'ii', $id, $userId);
+    mysqli_stmt_execute($stmt);
+    $result = mysqli_stmt_get_result($stmt);
+    $row = mysqli_fetch_assoc($result);
+    mysqli_stmt_close($stmt);
+
+    if(!$row) {
+        return ['error' => '密钥不存在或无权操作'];
+    }
+    if(empty($row['key_cipher'])) {
+        return ['error' => '该密钥创建于旧版本，无法再次获取明文，请点击「重新生成」后再复制'];
+    }
+
+    $plain = ct_decrypt((string)$row['key_cipher']);
+    if(!is_string($plain) || $plain === '' || !hash_equals((string)$row['key_hash'], api_key_hash($plain))) {
+        return ['error' => '密钥校验失败，请重新生成后再复制'];
+    }
+    return ['api_key' => $plain];
+}
+
+/**
  * 重新生成密钥（旧明文立即失效，返回新明文）
  * @param object $DB
  * @param int $id 密钥 ID
@@ -156,10 +242,23 @@ function api_key_regen($DB, int $id, int $userId): array {
     $key = api_key_generate();
     $hash = api_key_hash($key);
     $prefix = api_key_prefix_from_key($key);
+    $cipher = api_key_encrypt_value($key);
 
-    $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_prefix = ?, updated_at = NOW() WHERE id = ? AND user_id = ?');
-    if($stmt === false) return [];
-    mysqli_stmt_bind_param($stmt, 'ssii', $hash, $prefix, $id, $userId);
+    $hasCipherCol = api_key_has_cipher_column($DB);
+    if($hasCipherCol && $cipher !== '') {
+        $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_cipher = ?, key_prefix = ?, updated_at = NOW() WHERE id = ? AND user_id = ?');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'sssii', $hash, $cipher, $prefix, $id, $userId);
+    } elseif($hasCipherCol) {
+        // 加密失败时清空旧副本，避免复制到与哈希不一致的旧密钥
+        $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_cipher = NULL, key_prefix = ?, updated_at = NOW() WHERE id = ? AND user_id = ?');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'ssii', $hash, $prefix, $id, $userId);
+    } else {
+        $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_prefix = ?, updated_at = NOW() WHERE id = ? AND user_id = ?');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'ssii', $hash, $prefix, $id, $userId);
+    }
     $ok = mysqli_stmt_execute($stmt);
     $affected = mysqli_stmt_affected_rows($stmt);
     mysqli_stmt_close($stmt);
@@ -393,9 +492,22 @@ function api_key_regen_admin($DB, int $id): array {
     $key = api_key_generate();
     $hash = api_key_hash($key);
     $prefix = api_key_prefix_from_key($key);
-    $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_prefix = ?, updated_at = NOW() WHERE id = ?');
-    if($stmt === false) return [];
-    mysqli_stmt_bind_param($stmt, 'ssi', $hash, $prefix, $id);
+    $cipher = api_key_encrypt_value($key);
+    $hasCipherCol = api_key_has_cipher_column($DB);
+
+    if($hasCipherCol && $cipher !== '') {
+        $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_cipher = ?, key_prefix = ?, updated_at = NOW() WHERE id = ?');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'sssi', $hash, $cipher, $prefix, $id);
+    } elseif($hasCipherCol) {
+        $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_cipher = NULL, key_prefix = ?, updated_at = NOW() WHERE id = ?');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'ssi', $hash, $prefix, $id);
+    } else {
+        $stmt = mysqli_prepare($DB->link, 'UPDATE api_keys SET key_hash = ?, key_prefix = ?, updated_at = NOW() WHERE id = ?');
+        if($stmt === false) return [];
+        mysqli_stmt_bind_param($stmt, 'ssi', $hash, $prefix, $id);
+    }
     $ok = mysqli_stmt_execute($stmt);
     $affected = mysqli_stmt_affected_rows($stmt);
     mysqli_stmt_close($stmt);

@@ -6,7 +6,8 @@ declare(strict_types=1);
  * @file        api/api_keys.php
  * @description 用户端密钥 CRUD：list / create / regen / delete / toggle
  *              全部操作均要求用户已登录（$isUserLoggedIn）+ CSRF 校验
- *              明文密钥仅在 create / regen 时返回一次，DB 只存 SHA-256 哈希
+ *              明文密钥仅在 create / regen 时展示一次；后续可通过 copy 接口
+ *              获取本人密钥的明文（不展示，仅用于前端复制），列表接口不返回明文
  * @author      eecms
  * @version     1.1.0-dev
  * @date        2026-08-04
@@ -34,12 +35,29 @@ $action = isset($_GET['action']) ? $_GET['action'] : (isset($_POST['action']) ? 
 $uid    = (int)$currentUserId;
 
 // ========== CSRF 校验：仅写操作校验（list 为查询，按 CSRF 规范 GET 不需校验） ==========
-$writeActions = ['create', 'regen', 'delete', 'toggle'];
+$writeActions = ['create', 'regen', 'delete', 'toggle', 'copy'];
 if(in_array($action, $writeActions, true) && !csrf_verify()) {
     api_keys_json(201, '安全校验失败，请刷新页面后重试');
 }
 
 switch($action) {
+
+// ========== 复制本人密钥：仅返回明文给前端复制，不用于展示 ==========
+case 'copy':
+    if(!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'POST') {
+        api_keys_json(405, '仅允许 POST 请求');
+    }
+    $id = (int)(isset($_POST['id']) ? $_POST['id'] : 0);
+    if($id <= 0) {
+        api_keys_json(1, '参数无效');
+    }
+    $ret = api_key_get_plain($DB, $id, $uid);
+    if(isset($ret['error'])) {
+        api_keys_json(1, $ret['error']);
+    }
+    // 仅返回密钥本身；响应头已设置 no-store，前端复制后不写入 DOM
+    api_keys_json(0, 'ok', ['api_key' => $ret['api_key']]);
+    break;
 
 // ========== 获取当前用户密钥列表 ==========
 case 'list':
@@ -76,7 +94,7 @@ case 'create':
     if(empty($ret)) {
         api_keys_json(1, '生成密钥失败，请稍后重试');
     }
-    api_keys_json(0, '密钥生成成功，请立即复制保存（明文仅展示一次）', [
+    api_keys_json(0, '密钥生成成功，请复制保存（明文仅展示一次，之后可在列表点击复制）', [
         'api_key'     => $ret['api_key'],
         'id'          => $ret['id'],
         'key_prefix'  => $ret['key_prefix'],
@@ -93,7 +111,7 @@ case 'regen':
     if(empty($ret)) {
         api_keys_json(1, '重新生成失败，密钥不存在或无权操作');
     }
-    api_keys_json(0, '密钥已重新生成，请立即复制保存（明文仅展示一次）', [
+    api_keys_json(0, '密钥已重新生成，请复制保存（明文仅展示一次，之后可在列表点击复制）', [
         'api_key'    => $ret['api_key'],
         'key_prefix' => $ret['key_prefix'],
     ]);
