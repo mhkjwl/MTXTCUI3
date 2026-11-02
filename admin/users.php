@@ -132,6 +132,67 @@ if(isset($_POST['action'])) {
         ]);
     }
 
+    // ========== 手动新增用户 ==========
+    if($action === 'create') {
+        $username = trim($_POST['username'] ?? '');
+        $email    = trim($_POST['email'] ?? '');
+        $password = (string)($_POST['password'] ?? '');
+        $role     = $_POST['role'] ?? 'user';
+        $status   = (int)($_POST['status'] ?? 1);
+        $verified = (int)($_POST['email_verified'] ?? 1) ? 1 : 0;
+
+        // 与用户中心注册保持一致的账号规则
+        if(strlen($username) < 3 || strlen($username) > 32) json_exit(1, '用户名长度需要 3-32 个字符');
+        if(!preg_match('/^[a-zA-Z0-9_\x{4e00}-\x{9fa5}]+$/u', $username)) {
+            json_exit(1, '用户名只能包含字母、数字、下划线、中文');
+        }
+        if(strlen($password) < 6 || strlen($password) > 64) json_exit(1, '密码长度需要 6-64 个字符');
+        if(!preg_match('/[a-zA-Z]/', $password) || !preg_match('/[0-9]/', $password)) {
+            json_exit(1, '密码必须包含字母和数字');
+        }
+        if($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) json_exit(1, '邮箱格式不正确');
+        if(!in_array($role, ['super_admin', 'user'], true)) json_exit(1, '角色参数错误');
+        if(!in_array($status, [0, 1], true)) json_exit(1, '状态参数错误');
+
+        $dup = $DB->get_row_prepared("SELECT id FROM eecms_users WHERE username=?", 's', [$username]);
+        if($dup) json_exit(1, '该用户名已存在');
+        if($email !== '') {
+            $emailDup = $DB->get_row_prepared("SELECT id FROM eecms_users WHERE email=? AND email<>''", 's', [$email]);
+            if($emailDup) json_exit(1, '该邮箱已被其他用户使用');
+        }
+
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+        $newId = $DB->insert_prepared(
+            "INSERT INTO eecms_users (username, password, email, role, status, email_verified, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())",
+            'ssssii',
+            [$username, $hash, $email, $role, $status, $verified]
+        );
+        if(!$newId || $newId <= 0) {
+            error_log('users.php create failed: ' . $DB->error());
+            json_exit(1, '用户创建失败，请重试！');
+        }
+
+        // 分配默认套餐（与注册流程一致；失败不影响账号创建，兜底逻辑仍会使用默认套餐）
+        $defaultPkg = get_default_package($DB);
+        if($defaultPkg) {
+            $defExpire = date('Y-m-d H:i:s', strtotime('+10 years'));
+            pkg_safe_query_prepared(
+                $DB,
+                "INSERT INTO eecms_user_subs (user_id, package_id, package_level, package_name, expire_time) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE package_id=VALUES(package_id), package_level=VALUES(package_level), package_name=VALUES(package_name), expire_time=VALUES(expire_time)",
+                'iiiss',
+                [(int)$newId, (int)$defaultPkg['id'], (int)$defaultPkg['level'], $defaultPkg['name'], $defExpire]
+            );
+        }
+
+        log_admin_action($DB, 'user_create', 'user', (int)$newId, [
+            'username' => $username,
+            'role'     => $role,
+            'status'   => $status,
+            'verified' => $verified,
+        ]);
+        json_exit(0, '用户创建成功', ['id' => (int)$newId]);
+    }
+
     if($action === 'update') {
         $id       = intval($_POST['id'] ?? 0);
         $username = trim($_POST['username'] ?? '');
@@ -597,12 +658,15 @@ if(isset($_POST['action'])) {
   <div class="card">
     <div class="card-header">
       <div class="card-title"><?php echo icon('account-group-outline'); ?> 用户列表</div>
-      <div id="batchBar" class="batch-toolbar" style="display:none;">
-        <span class="batch-info"><?php echo icon('checkbox-multiple-marked-outline'); ?> 已选择 <strong id="selectedCount">0</strong> 项</span>
-        <button type="button" class="btn btn-success btn-sm" onclick="batchSetStatus(1)"><?php echo icon('account-check'); ?> 批量启用</button>
-        <button type="button" class="btn btn-warning btn-sm" onclick="batchSetStatus(0)"><?php echo icon('account-cancel'); ?> 批量封禁</button>
-        <button type="button" class="btn btn-danger btn-sm" onclick="batchDeleteSelected()"><?php echo icon('delete-sweep'); ?> 批量删除</button>
-        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="clearSelection()"><?php echo icon('close'); ?> 取消选择</button>
+      <div class="d-flex align-items-center gap-2 ms-auto flex-wrap">
+        <button type="button" class="btn btn-primary btn-sm" onclick="openCreateUser()"><?php echo icon('account-plus-outline'); ?> 新增用户</button>
+        <div id="batchBar" class="batch-toolbar" style="display:none;">
+          <span class="batch-info"><?php echo icon('checkbox-multiple-marked-outline'); ?> 已选择 <strong id="selectedCount">0</strong> 项</span>
+          <button type="button" class="btn btn-success btn-sm" onclick="batchSetStatus(1)"><?php echo icon('account-check'); ?> 批量启用</button>
+          <button type="button" class="btn btn-warning btn-sm" onclick="batchSetStatus(0)"><?php echo icon('account-cancel'); ?> 批量封禁</button>
+          <button type="button" class="btn btn-danger btn-sm" onclick="batchDeleteSelected()"><?php echo icon('delete-sweep'); ?> 批量删除</button>
+          <button type="button" class="btn btn-outline-secondary btn-sm" onclick="clearSelection()"><?php echo icon('close'); ?> 取消选择</button>
+        </div>
       </div>
     </div>
     <div class="card-body p-0">
@@ -734,6 +798,66 @@ if(isset($_POST['action'])) {
   </div>
 </div>
 
+<!-- 新增用户 Modal -->
+<div class="modal fade" id="createUserModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><?php echo icon('account-plus-outline'); ?> 新增用户</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body">
+        <form id="createUserForm" onsubmit="saveCreateUser(); return false;">
+          <div class="mb-3">
+            <label class="form-label">用户名 <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" id="newUsername" maxlength="32" placeholder="3-32 个字符，支持字母、数字、下划线、中文">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">邮箱</label>
+            <input type="email" class="form-control" id="newEmail" placeholder="选填，用于邮箱验证与找回密码">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">密码 <span class="text-danger">*</span></label>
+            <input type="password" class="form-control" id="newPassword" maxlength="64" autocomplete="new-password" placeholder="6-64 位，需同时包含字母和数字">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">确认密码 <span class="text-danger">*</span></label>
+            <input type="password" class="form-control" id="newPasswordConfirm" maxlength="64" autocomplete="new-password" placeholder="再次输入密码">
+          </div>
+          <div class="row g-2">
+            <div class="col-md-6 mb-3">
+              <label class="form-label">用户中心角色</label>
+              <select class="form-select" id="newRole">
+                <option value="user">普通用户</option>
+                <option value="super_admin">超级管理员</option>
+              </select>
+              <small class="text-muted d-block mt-1">仅影响用户中心权限，<b>不等于后台登录权限</b>。</small>
+            </div>
+            <div class="col-md-6 mb-3">
+              <label class="form-label">状态</label>
+              <select class="form-select" id="newStatus">
+                <option value="1">启用</option>
+                <option value="0">禁用</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="newVerified" checked>
+            <label class="form-check-label" for="newVerified">标记邮箱已验证（后台手动创建建议勾选）</label>
+          </div>
+          <div class="alert alert-info py-2 mb-0" style="font-size:13px;">
+            创建后用户即可使用该账号登录用户中心；套餐默认按系统默认套餐分配，可在创建后通过「编辑」调整。
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="createUserSubmit" onclick="saveCreateUser()"><?php echo icon('account-plus'); ?> 创建用户</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- 重置密码 Modal -->
 <div class="modal fade" id="resetPwdModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog modal-dialog-centered">
@@ -770,13 +894,14 @@ if(isset($_POST['action'])) {
 var CSRF_TOKEN = '<?php echo csrf_token();?>';
 // M5 修复：CSRF Token 统一通过 Header 传递，不再放 POST Body
 $.ajaxSetup({ beforeSend: function(xhr){ xhr.setRequestHeader('X-CSRF-Token', CSRF_TOKEN); } });
-var editModal, resetPwdModal;
+var editModal, resetPwdModal, createUserModal;
 var _usersCache = [];
 var _currentPage = 1;
 
 window.addEventListener('DOMContentLoaded', function(){
     editModal = new bootstrap.Modal(document.getElementById('editModal'));
     resetPwdModal = new bootstrap.Modal(document.getElementById('resetPwdModal'));
+    createUserModal = new bootstrap.Modal(document.getElementById('createUserModal'));
     $('#customStorageSwitch').on('change', function(){
         if($(this).prop('checked')){
             $('#customStorageValueBox').show();
@@ -1145,6 +1270,78 @@ function findUser(id){
         if(_usersCache[i].id == id) return _usersCache[i];
     }
     return null;
+}
+
+// ========== 新增用户 ==========
+function openCreateUser(){
+    var form = document.getElementById('createUserForm');
+    if(form) form.reset();
+    document.getElementById('newRole').value = 'user';
+    document.getElementById('newStatus').value = '1';
+    document.getElementById('newVerified').checked = true;
+    createUserModal.show();
+    setTimeout(function(){ document.getElementById('newUsername').focus(); }, 200);
+}
+
+function saveCreateUser(){
+    var username = $.trim($('#newUsername').val());
+    var email    = $.trim($('#newEmail').val());
+    var password = $('#newPassword').val();
+    var confirm  = $('#newPasswordConfirm').val();
+    var role     = $('#newRole').val();
+    var status   = $('#newStatus').val();
+    var verified = $('#newVerified').prop('checked') ? 1 : 0;
+
+    if(username.length < 3 || username.length > 32){
+        toast('warning', '用户名长度需要 3-32 个字符'); return;
+    }
+    if(!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)){
+        toast('warning', '用户名只能包含字母、数字、下划线、中文'); return;
+    }
+    if(password.length < 6 || password.length > 64){
+        toast('warning', '密码长度需要 6-64 个字符'); return;
+    }
+    if(!/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)){
+        toast('warning', '密码必须包含字母和数字'); return;
+    }
+    if(password !== confirm){
+        toast('warning', '两次输入的密码不一致'); return;
+    }
+    if(email !== '' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){
+        toast('warning', '邮箱格式不正确'); return;
+    }
+
+    var $btn = $('#createUserSubmit');
+    var origHtml = $btn.html();
+    $btn.prop('disabled', true).text('创建中…');
+
+    $.ajax({
+        url: 'users.php', type: 'POST', dataType: 'json',
+        data: {
+            action: 'create',
+            username: username,
+            email: email,
+            password: password,
+            role: role,
+            status: status,
+            email_verified: verified
+        },
+        success: function(res){
+            $btn.prop('disabled', false).html(origHtml);
+            if(res.code === 0){
+                createUserModal.hide();
+                toast('success', res.msg || '用户创建成功');
+                // 列表按 id 升序，新建用户位于最后一页；传大页码由后端自动收敛到末页
+                loadUsers(999999);
+            } else {
+                toast('error', res.msg || '创建失败');
+            }
+        },
+        error: function(){
+            $btn.prop('disabled', false).html(origHtml);
+            toast('error', '网络错误，请重试');
+        }
+    });
 }
 
 function openEdit(id){
