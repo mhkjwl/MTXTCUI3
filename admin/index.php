@@ -21,7 +21,7 @@ if(!isset($islogin) || $islogin!=1) exit("<script>location.href='login.php';</sc
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=0, minimal-ui">
 <title>后台首页 - <?php echo htmlspecialchars($conf['name'] ?? 'EECMS', ENT_QUOTES, 'UTF-8');?></title>
-<link rel="shortcut icon" type="image/x-icon" href="../favicon.ico">
+<link rel="shortcut icon" type="image/x-icon" href="<?php echo htmlspecialchars(site_favicon_href('../'), ENT_QUOTES, 'UTF-8');?>">
 <script>
 // 渲染前应用已保存主题，避免闪烁（app.js 会接管后续主题逻辑）
 (function(){

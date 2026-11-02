@@ -1,7 +1,7 @@
 <?php
 /**
  * @file index.php
- * @description 用户中心仪表盘，上传管理图片、修改密码、查看统计
+ * @description 用户中心仪表盘，上传管理图片、修改信息/密码、查看统计
  * @author AI
  * @version 1.3.6-dev
  * @date 2026-08-05
@@ -10,7 +10,7 @@ declare(strict_types=1);
 
 /**
  * 用户中心 - 仪表盘
- * 上传、管理图片、修改密码、查看统计
+ * 上传、管理图片、修改信息/密码、查看统计
  * 超级管理员可查看所有用户图片
  */
 header('Cache-Control: no-cache, no-store, must-revalidate');
@@ -106,6 +106,7 @@ if(!$isSuperAdmin) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/x-icon" href="<?php echo htmlspecialchars(site_favicon_href('../'), ENT_QUOTES, 'UTF-8');?>">
   <title>用户中心 - <?php echo htmlspecialchars($siteName);?></title>
   <link href="../admin/style/css/materialdesignicons.min.css" rel="stylesheet">
   <link href="../bd/qd.css" rel="stylesheet">
@@ -160,7 +161,10 @@ if(!$isSuperAdmin) {
     .sidebar-overlay.show{display:block}
     @media(max-width:1280px){
       .menu-toggle{display:flex;align-items:center;justify-content:center}
-      .sidebar{position:fixed;left:0;top:0;bottom:0;z-index:180;transform:translateX(-100%);transition:transform .3s ease;height:100vh}
+      /* 给固定定位的菜单按钮留出空间，避免遮挡页面标题 */
+      .topbar{padding-left:64px}
+      .sidebar{position:fixed;left:0;top:0;bottom:0;z-index:180;transform:translateX(-100%);transition:transform .3s ease;height:100vh;background:#fff;padding-top:72px;box-shadow:0 20px 60px rgba(30,26,46,0.18);overflow-y:auto}
+      [data-theme="dark"] .sidebar{background:rgba(30,26,46,0.96)}
       .sidebar.open{transform:translateX(0)}
     }
     /* 移动端：topbar-actions 允许换行 + profile-card 纵向 + stats-grid 2列 */
@@ -169,13 +173,24 @@ if(!$isSuperAdmin) {
       .profile-card{flex-direction:column;text-align:center;gap:16px;padding:20px}
       .profile-avatar{width:64px;height:64px;font-size:26px}
       .profile-head{flex-direction:column;align-items:center;gap:12px}
-      .profile-name-row{justify-content:center}
+      .profile-name-row{justify-content:center;max-width:100%}
+      .profile-name{max-width:100%;overflow-wrap:anywhere}
       .profile-head-actions{flex-direction:column;gap:10px;width:100%}
       .profile-head-actions .profile-pwd-btn{width:100%;justify-content:center}
       .profile-meta{grid-template-columns:1fr;gap:10px 16px}
       .profile-meta-item{justify-content:center;font-size:0.84rem}
-      .stats-grid{grid-template-columns:1fr!important}
+      .stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:12px!important}
       #home-section .hero-grid{grid-template-columns:1fr}
+    }
+    @media(max-width:640px){
+      /* 手机端隐藏时钟，给主题/API/用户菜单留出空间 */
+      #clockDisplay{display:none!important}
+    }
+    @media(max-width:360px){
+      .stats-grid{grid-template-columns:1fr!important}
+      /* 超窄屏把 API 文档按钮收成图标，保证顶部操作不换行 */
+      .topbar-actions .ghost-btn{width:40px;height:40px;padding:0;justify-content:center;gap:0;font-size:0}
+      .topbar-actions .ghost-btn i{font-size:20px}
     }
 
     /* Toast 通知 */
@@ -432,6 +447,47 @@ if(!$isSuperAdmin) {
     .role-badge.admin{background:linear-gradient(135deg,#ff7fa8,#ff9d6c);color:#fff}
     .role-badge.user{background:linear-gradient(135deg,#67b7ff,#59e3ff);color:#fff}
 
+    /* 右上角用户下拉（与后台风格一致） */
+    .user-menu{position:relative;flex-shrink:0}
+    .user-menu-toggle{display:flex;align-items:center;gap:9px;padding:5px 10px 5px 6px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,0.72);color:var(--text);cursor:pointer;font:inherit;transition:background .2s ease,border-color .2s ease}
+    [data-theme="dark"] .user-menu-toggle{background:rgba(30,26,46,0.72)}
+    .user-menu-toggle:hover{border-color:var(--primary);background:rgba(123,140,255,0.08)}
+    .user-menu .avatar-circle{width:32px;height:32px;font-size:14px}
+    .user-menu-meta{display:flex;flex-direction:column;align-items:flex-start;line-height:1.15;max-width:130px}
+    .user-menu-meta strong{font-size:0.84rem;font-weight:700;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .user-menu-meta small{font-size:0.7rem;color:var(--muted);margin-top:2px}
+    .user-menu-arrow{font-size:18px;color:var(--muted);transition:transform .2s ease}
+    .user-menu.open .user-menu-arrow{transform:rotate(180deg)}
+    .user-menu-dropdown{position:absolute;right:0;top:calc(100% + 8px);min-width:190px;padding:6px;border-radius:14px;background:var(--panel-strong);border:1px solid var(--line);box-shadow:var(--shadow);opacity:0;visibility:hidden;transform:translateY(-6px);transition:opacity .16s ease,transform .16s ease,visibility .16s;z-index:1500}
+    .user-menu.open .user-menu-dropdown{opacity:1;visibility:visible;transform:translateY(0)}
+    .user-menu-item{display:flex;align-items:center;gap:9px;width:100%;padding:10px 12px;border-radius:9px;border:0;background:transparent;color:var(--text);font:inherit;font-size:0.9rem;text-align:left;cursor:pointer;text-decoration:none}
+    .user-menu-item i{font-size:18px;width:20px;text-align:center;flex-shrink:0}
+    .user-menu-item:hover{background:rgba(123,140,255,0.1);color:var(--primary)}
+    .user-menu-item.danger{color:var(--danger)}
+    .user-menu-item.danger:hover{background:rgba(255,127,168,0.12);color:var(--danger)}
+    .user-menu-divider{height:1px;background:var(--line);margin:5px 8px}
+
+    /* 修改信息页 */
+    .profile-edit-card{padding:28px}
+    .profile-edit-grid{display:grid;grid-template-columns:220px 1fr;gap:32px;align-items:start}
+    .profile-edit-side{border-right:1px solid var(--line);padding-right:28px;text-align:center}
+    .profile-edit-side .profile-avatar{width:76px;height:76px;margin:0 auto 14px}
+    .profile-edit-side h3{margin:0 0 6px;font-size:1.1rem;color:var(--text)}
+    .profile-edit-side .role-badge{display:inline-flex;margin-bottom:16px}
+    .profile-edit-meta{display:flex;flex-direction:column;gap:8px;color:var(--muted);font-size:0.82rem;text-align:left}
+    .profile-edit-meta div{display:flex;justify-content:space-between;gap:10px}
+    .profile-edit-meta span{color:var(--text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .profile-edit-form .pwd-form-group{margin-bottom:16px}
+    .profile-edit-hint{font-size:0.8rem;color:var(--muted);line-height:1.6;margin:0 0 18px}
+    .profile-edit-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    @media (max-width:768px){
+      .user-menu-meta{display:none}
+      .user-menu-toggle{padding:4px}
+      .profile-edit-grid{grid-template-columns:1fr;gap:22px}
+      .profile-edit-side{border-right:0;border-bottom:1px solid var(--line);padding:0 0 20px}
+      .profile-edit-meta{max-width:320px;margin:0 auto}
+    }
+
     /* 页脚 */
     .footer{margin-top:32px;padding:24px;text-align:center;color:var(--muted);font-size:0.84rem;border-top:1px solid var(--line)}
     .footer a{color:var(--primary);text-decoration:none}
@@ -490,7 +546,6 @@ if(!$isSuperAdmin) {
         <a href="../admin/setting.php"><i class="mdi mdi-cog-outline"></i> 系统设置</a>
         <?php endif; ?>
         <a href="../index.php"><i class="mdi mdi-home-outline"></i> 返回首页</a>
-        <a href="logout.php"><i class="mdi mdi-logout"></i> 退出登录</a>
       </nav>
 
       <div class="storage-card soft-card">
@@ -530,18 +585,35 @@ if(!$isSuperAdmin) {
         <div class="topbar-actions">
           <div id="clockDisplay"><span></span></div>
           <button id="themeToggle" type="button" title="切换主题"><i class="mdi mdi-weather-night"></i></button>
-          <button id="navChangePwd" type="button" title="修改密码"><i class="mdi mdi-lock-reset"></i></button>
-          <a class="ghost-btn" href="../api_doc.php"><i class="mdi mdi-file-document-outline"></i> API 文档</a>
-          <div class="avatar-circle">
-            <?php if($userAvatar): ?>
-            <img src="<?php echo htmlspecialchars($userAvatar);?>" alt="avatar">
-            <?php else: ?>
-            <?php echo htmlspecialchars($firstChar);?>
-            <?php endif; ?>
+          <a class="ghost-btn" href="../api_doc.php" title="API 文档"><i class="mdi mdi-file-document-outline"></i> API 文档</a>
+          <div class="user-menu" id="userMenu">
+            <button type="button" class="user-menu-toggle" id="userMenuToggle" aria-haspopup="true" aria-expanded="false">
+              <span class="avatar-circle">
+                <?php if($userAvatar): ?>
+                <img src="<?php echo htmlspecialchars($userAvatar);?>" alt="avatar">
+                <?php else: ?>
+                <span id="userMenuInitial"><?php echo htmlspecialchars($firstChar);?></span>
+                <?php endif; ?>
+              </span>
+              <span class="user-menu-meta">
+                <strong id="userMenuName"><?php echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8');?></strong>
+                <small><?php echo $isSuperAdmin ? '超级管理员' : '普通用户';?></small>
+              </span>
+              <i class="mdi mdi-chevron-down user-menu-arrow"></i>
+            </button>
+            <div class="user-menu-dropdown" id="userMenuDropdown" role="menu">
+              <a href="#profile-section" class="user-menu-item" id="menuProfile" role="menuitem">
+                <i class="mdi mdi-account-edit-outline"></i> 修改信息
+              </a>
+              <button type="button" class="user-menu-item" id="menuChangePwd" role="menuitem">
+                <i class="mdi mdi-lock-reset"></i> 修改密码
+              </button>
+              <div class="user-menu-divider"></div>
+              <button type="button" class="user-menu-item danger" id="menuLogout" role="menuitem">
+                <i class="mdi mdi-logout"></i> 退出登录
+              </button>
+            </div>
           </div>
-          <span class="role-badge <?php echo $isSuperAdmin ? 'admin' : 'user';?>">
-            <?php echo $isSuperAdmin ? '超级管理员' : '普通用户';?>
-          </span>
         </div>
       </header>
 
@@ -568,23 +640,15 @@ if(!$isSuperAdmin) {
         <div class="profile-info">
           <div class="profile-head">
             <div class="profile-name-row">
-              <h3 class="profile-name"><?php echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8'); ?></h3>
+              <h3 class="profile-name" id="profileNameText"><?php echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8'); ?></h3>
               <span class="role-badge <?php echo $isSuperAdmin ? 'admin' : 'user'; ?>"><?php echo $isSuperAdmin ? '超级管理员' : '普通用户'; ?></span>
-            </div>
-            <div class="profile-head-actions">
-              <button type="button" class="profile-pwd-btn" id="profileChangePwdBtn" title="修改密码">
-                <i class="mdi mdi-lock-reset"></i> 修改密码
-              </button>
-              <a href="logout.php" class="profile-pwd-btn" title="退出登录" style="text-decoration:none;">
-                <i class="mdi mdi-logout"></i> 退出登录
-              </a>
             </div>
           </div>
           <div class="profile-meta">
             <div class="profile-meta-item">
               <i class="mdi mdi-email-outline"></i>
               <span class="profile-meta-label">邮箱</span>
-              <span class="profile-meta-value"><?php echo $userEmailDisplay; ?></span>
+              <span class="profile-meta-value" id="profileEmailText"><?php echo $userEmailDisplay; ?></span>
             </div>
             <div class="profile-meta-item">
               <i class="mdi mdi-package-variant-closed"></i>
@@ -786,6 +850,52 @@ if(!$isSuperAdmin) {
         </article>
       </section>
       </section><!-- /home-section -->
+
+      <!-- 修改信息 -->
+      <section id="profile-section" class="page-section" style="display:none">
+        <div class="soft-card profile-edit-card">
+          <div class="section-heading">
+            <div>
+              <p class="section-caption">Account</p>
+              <h3>修改信息</h3>
+            </div>
+          </div>
+          <div class="profile-edit-grid">
+            <div class="profile-edit-side">
+              <div class="profile-avatar">
+                <?php if($userAvatar !== ''): ?>
+                <img src="<?php echo htmlspecialchars($userAvatar, ENT_QUOTES, 'UTF-8');?>" alt="<?php echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8');?>">
+                <?php else: ?>
+                <span id="profileAvatarInitial"><?php echo htmlspecialchars($firstChar, ENT_QUOTES, 'UTF-8');?></span>
+                <?php endif; ?>
+              </div>
+              <h3 id="profileSideName"><?php echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8');?></h3>
+              <span class="role-badge <?php echo $isSuperAdmin ? 'admin' : 'user';?>"><?php echo $isSuperAdmin ? '超级管理员' : '普通用户';?></span>
+              <div class="profile-edit-meta">
+                <div><span>用户名</span><span id="profileSideUsername"><?php echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8');?></span></div>
+                <div><span>邮箱</span><span id="profileSideEmail"><?php echo $userEmailDisplay;?></span></div>
+                <div><span>注册时间</span><span><?php echo htmlspecialchars($userCreatedText, ENT_QUOTES, 'UTF-8');?></span></div>
+                <div><span>最后登录</span><span><?php echo htmlspecialchars($userLastLoginText, ENT_QUOTES, 'UTF-8');?></span></div>
+              </div>
+            </div>
+            <form id="profileForm" class="profile-edit-form" autocomplete="off">
+              <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8');?>">
+              <div class="pwd-form-group">
+                <label for="profileUsername">用户名</label>
+                <input type="text" id="profileUsername" name="username" maxlength="32" value="<?php echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8');?>" placeholder="3-32 个字符">
+              </div>
+              <div class="pwd-form-group">
+                <label for="profileEmail">邮箱</label>
+                <input type="email" id="profileEmail" name="email" maxlength="120" value="<?php echo htmlspecialchars($userEmail, ENT_QUOTES, 'UTF-8');?>" placeholder="选填，用于找回密码与通知">
+              </div>
+              <p class="profile-edit-hint">用户名支持字母、数字、下划线、中文，长度 3-32 个字符；邮箱选填，修改后请确保可以正常收信。</p>
+              <div class="profile-edit-actions">
+                <button type="button" class="primary-btn" id="profileSaveBtn"><i class="mdi mdi-content-save-outline"></i> 保存修改</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
 
       <!-- 图片管理 -->
       <section class="gallery-section soft-card page-section" id="gallery-section" style="display:none">
@@ -1195,12 +1305,6 @@ document.getElementById('pricingRetry').addEventListener('click', function(){
 document.querySelectorAll('.side-nav a').forEach(function(item){
   item.addEventListener('click', function(e){
     var href = this.getAttribute('href');
-    // 按钮型链接（修改密码等）不参与区段切换
-    if(this.id === 'navChangePwd'){
-      document.getElementById('sidebar').classList.remove('open');
-      document.getElementById('sidebarOverlay').classList.remove('show');
-      return;
-    }
     // 区段切换链接（href 以 # 开头且长度大于 1，有对应 section）
     if(href && href.length > 1 && href.charAt(0) === '#'){
       var targetId = href.substring(1);
@@ -1789,19 +1893,113 @@ document.getElementById('viewerOverlay').addEventListener('click', function(e){
   }
 });
 
-// ===== 修改密码 =====
-document.getElementById('navChangePwd').addEventListener('click', function(e){
-  e.preventDefault();
-  document.getElementById('pwdModalOverlay').classList.add('show');
-});
-// 个人信息卡片内的修改密码按钮（复用同一弹窗）
-var profilePwdBtn = document.getElementById('profileChangePwdBtn');
-if(profilePwdBtn){
-  profilePwdBtn.addEventListener('click', function(e){
+// ===== 右上角用户菜单 =====
+(function(){
+  var menu = document.getElementById('userMenu');
+  var toggle = document.getElementById('userMenuToggle');
+  if(!menu || !toggle) return;
+
+  function closeMenu(){
+    menu.classList.remove('open');
+    toggle.setAttribute('aria-expanded', 'false');
+  }
+
+  toggle.addEventListener('click', function(e){
+    e.stopPropagation();
+    var open = menu.classList.toggle('open');
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  document.addEventListener('click', function(e){
+    if(!menu.contains(e.target)) closeMenu();
+  });
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape') closeMenu();
+  });
+
+  document.getElementById('menuProfile').addEventListener('click', function(e){
     e.preventDefault();
+    closeMenu();
+    switchSection('profile-section');
+  });
+  document.getElementById('menuChangePwd').addEventListener('click', function(){
+    closeMenu();
     document.getElementById('pwdModalOverlay').classList.add('show');
   });
-}
+  document.getElementById('menuLogout').addEventListener('click', function(){
+    closeMenu();
+    showConfirm('退出登录', '确定要退出当前账号吗？退出后需要重新登录。', '退出登录').then(function(ok){
+      if(ok) window.location.href = 'logout.php';
+    });
+  });
+})();
+
+// ===== 修改信息 =====
+(function(){
+  var saveBtn = document.getElementById('profileSaveBtn');
+  if(!saveBtn) return;
+
+  saveBtn.addEventListener('click', function(){
+    var username = (document.getElementById('profileUsername').value || '').trim();
+    var email = (document.getElementById('profileEmail').value || '').trim();
+
+    if(username.length < 3 || username.length > 32){
+      notify('用户名长度需要 3-32 个字符', 'warning'); return;
+    }
+    if(!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)){
+      notify('用户名只能包含字母、数字、下划线、中文', 'warning'); return;
+    }
+    if(email !== '' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){
+      notify('请输入有效的邮箱地址', 'warning'); return;
+    }
+
+    var origHTML = saveBtn.innerHTML;
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<i class="mdi mdi-loading mdi-spin"></i> 保存中...';
+
+    var fd = new FormData();
+    fd.append('username', username);
+    fd.append('email', email);
+    fd.append('csrf_token', csrfToken);
+
+    fetch('../api/user_api.php?action=update_profile', {method:'POST', body:fd})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = origHTML;
+        if(d.code !== 0){
+          notify(d.msg || '保存失败', 'error');
+          return;
+        }
+        var name = d.user && d.user.username ? d.user.username : username;
+        var mail = d.user && typeof d.user.email !== 'undefined' ? d.user.email : email;
+        var mailText = mail !== '' ? mail : '未设置';
+        var initial = name ? name.charAt(0).toUpperCase() : '';
+
+        ['userMenuName','profileNameText','profileSideName','profileSideUsername'].forEach(function(id){
+          var el = document.getElementById(id);
+          if(el) el.textContent = name;
+        });
+        var emailCard = document.getElementById('profileEmailText');
+        if(emailCard) emailCard.textContent = mailText;
+        var emailSide = document.getElementById('profileSideEmail');
+        if(emailSide) emailSide.textContent = mailText;
+        ['userMenuInitial','profileAvatarInitial'].forEach(function(id){
+          var el = document.getElementById(id);
+          if(el) el.textContent = initial;
+        });
+        document.getElementById('profileUsername').value = name;
+        document.getElementById('profileEmail').value = mail;
+        notify(d.msg || '个人信息已保存', 'success');
+      })
+      .catch(function(){
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = origHTML;
+        notify('网络错误，请重试', 'error');
+      });
+  });
+})();
+
+// ===== 修改密码 =====
 document.getElementById('pwdCancel').addEventListener('click', function(){
   document.getElementById('pwdModalOverlay').classList.remove('show');
   document.getElementById('pwdForm').reset();

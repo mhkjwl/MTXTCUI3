@@ -17,6 +17,7 @@ $siteName404 = isset($conf['name']) ? $conf['name'] : '图床';
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/x-icon" href="<?php echo htmlspecialchars(site_favicon_href(), ENT_QUOTES, 'UTF-8');?>">
 <title>404 - 页面不存在 - <?php echo htmlspecialchars($siteName404);?></title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }

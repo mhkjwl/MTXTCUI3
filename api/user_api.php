@@ -288,6 +288,59 @@ case 'profile':
     ]);
     exit;
 
+// ========== 修改个人信息（用户名 / 邮箱） ==========
+case 'update_profile':
+    if(!$isUserLoggedIn) {
+        echo json_encode(['code' => 1, 'msg' => '请先登录']);
+        exit;
+    }
+    if(!csrf_verify()) {
+        echo json_encode(['code' => 1, 'msg' => '安全校验失败，请刷新页面后重试']);
+        exit;
+    }
+
+    $username = trim(isset($_POST['username']) ? (string)$_POST['username'] : '');
+    $email    = trim(isset($_POST['email']) ? (string)$_POST['email'] : '');
+
+    if(strlen($username) < 3 || strlen($username) > 32) {
+        echo json_encode(['code' => 1, 'msg' => '用户名长度需要 3-32 个字符']);
+        exit;
+    }
+    if(!preg_match('/^[a-zA-Z0-9_\x{4e00}-\x{9fa5}]+$/u', $username)) {
+        echo json_encode(['code' => 1, 'msg' => '用户名只能包含字母、数字、下划线、中文']);
+        exit;
+    }
+    if($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        echo json_encode(['code' => 1, 'msg' => '请输入有效的邮箱地址']);
+        exit;
+    }
+
+    $dup = $DB->get_row_prepared("SELECT id FROM eecms_users WHERE username=? AND id<>?", 'si', [$username, $currentUserId]);
+    if($dup) {
+        echo json_encode(['code' => 1, 'msg' => '该用户名已被其他用户使用']);
+        exit;
+    }
+    if($email !== '') {
+        $emailDup = $DB->get_row_prepared("SELECT id FROM eecms_users WHERE email=? AND email<>'' AND id<>?", 'si', [$email, $currentUserId]);
+        if($emailDup) {
+            echo json_encode(['code' => 1, 'msg' => '该邮箱已被其他用户使用']);
+            exit;
+        }
+    }
+
+    $ok = $DB->query_prepared("UPDATE eecms_users SET username=?, email=? WHERE id=?", 'ssi', [$username, $email, $currentUserId]);
+    if($ok === false) {
+        echo json_encode(['code' => 1, 'msg' => '保存失败，请稍后重试']);
+        exit;
+    }
+
+    echo json_encode([
+        'code' => 0,
+        'msg'  => '个人信息已保存',
+        'user' => ['username' => $username, 'email' => $email],
+    ]);
+    exit;
+
 // ========== 修改密码 ==========
 case 'change_password':
     if(!$isUserLoggedIn) {

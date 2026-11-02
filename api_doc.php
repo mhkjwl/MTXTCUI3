@@ -176,6 +176,7 @@ if($docUserId > 0) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/x-icon" href="<?php echo htmlspecialchars(site_favicon_href(), ENT_QUOTES, 'UTF-8');?>">
   <title>API 对接文档 - <?php echo htmlspecialchars($siteName);?></title>
   <link href="admin/style/css/materialdesignicons.min.css" rel="stylesheet">
   <link href="bd/qd.css" rel="stylesheet">
@@ -270,8 +271,8 @@ if($docUserId > 0) {
           <h3>获取 API 密钥</h3>
           <ul>
             <li>登录个人中心 → API 密钥管理 → 点击「创建密钥」</li>
-            <li>密钥明文仅在创建时展示一次，请妥善保存</li>
-            <li>数据库仅存储 SHA-256 哈希，无法反查明文</li>
+            <li>密钥明文首次创建时展示一次；之后可在列表点击复制，不再回显明文</li>
+            <li>数据库保存 SHA-256 哈希与加密副本，仅本人登录后可主动复制</li>
             <li>每个用户最多可创建 20 个密钥</li>
             <li>密钥可随时启用/禁用/删除/重新生成</li>
           </ul>

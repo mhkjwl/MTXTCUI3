@@ -88,7 +88,7 @@ php -S 0.0.0.0:8080 -t . router.php
 ## 📁 目录结构
 
 ```
-├── index.php          # 前台主入口（Vue2 + Element UI 上传界面）
+├── index.php          # 官网首页（PHP 模板，读取站点配置/套餐/接口数量）
 ├── config.php         # 数据库配置（安装时自动写入）
 ├── header.php         # 公共引导（加载核心类库）
 ├── footer.php         # 公共页脚

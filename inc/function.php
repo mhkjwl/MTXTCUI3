@@ -14,6 +14,18 @@ if(!defined('ENCRYPT_KEY')) {
     catch (Throwable $e) { define('ENCRYPT_KEY', md5(uniqid((string)mt_rand(), true) . microtime(true))); }
 }
 
+/**
+ * 站点 favicon 地址：按 favicon.ico 的更新时间生成版本号，
+ * 保证后台上传/替换图标后，浏览器不会继续使用旧缓存
+ * @param string $prefix 相对路径前缀（根目录留空，子目录用 '../'）
+ * @return string
+ */
+function site_favicon_href($prefix = '') {
+    $favicon = dirname(__DIR__) . '/favicon.ico';
+    $version = is_file($favicon) ? (int)filemtime($favicon) : 0;
+    return $prefix . 'favicon.ico' . ($version > 0 ? '?v=' . $version : '');
+}
+
 // 统一配置 curl 的 SSL 证书校验：使用项目内置 Mozilla CA 包（inc/cacert.pem）
 // 防止出站请求被中间人攻击；CA 包缺失时回退不校验（避免硬故障）
 function curl_setup_ssl($ch) {

@@ -1,1296 +1,1866 @@
 <?php
 /**
  * @file index.php
- * @description 图床主入口页面，加载图床配置并渲染前端上传界面
- * @author AI
- * @version 1.1.0-dev
- * @date 2026-08-04
+ * @description 官网首页（静态设计适配真实系统），用户登录后进入用户中心
  */
-declare(strict_types=1);
+require __DIR__ . '/inc/common.php';
 
-    require ('./header.php');
+$siteName = trim((string)($conf['name'] ?? ''));
+if($siteName === '') $siteName = '图巢 PicNest';
 
-    // 防止浏览器缓存页面，确保后台修改访问控制/接口分组后前端立即生效
-    // 必须放在 session_start()（common.php 内）之后，以覆盖 session 的默认缓存策略
-    header('Cache-Control: no-cache, no-store, must-revalidate');
-    header('Pragma: no-cache');
-    header('Expires: 0');
+$apiConfig  = get_api_config();
+$apiCount   = count($apiConfig);
+$regEnabled = is_registration_enabled();
+$isAdmin    = isset($islogin) && $islogin == 1;
+$isUser     = !empty($isUserLoggedIn);
 
-    // ========== API 配置（统一配置源，消除三处硬编码） ==========
-    $apiConfig = get_api_config();
+$loginUrl      = 'user/login.php';
+$registerUrl   = 'user/register.php';
+$userCenterUrl = 'user/';
+$apiDocUrl     = 'api_doc.php';
+$pricingUrl    = 'user/pricing.php';
 
-    $defaultApi = isset($conf['api_default']) ? $conf['api_default'] : '';
-    $defaultValid = false;
-    if ($defaultApi !== '') {
-        $defEnableKey = 'api_'.$defaultApi.'_enable';
-        $defaultValid = isset($conf[$defEnableKey]) && $conf[$defEnableKey] == '1';
+$apiBase = (isset($conf['site_url']) && $conf['site_url'] !== '')
+    ? rtrim((string)$conf['site_url'], '/')
+    : rtrim((string)$siteurl, '/');
+$apiEndpoint = $apiBase . '/api/api_upload.php';
+
+$fmtBytes = function($bytes) {
+    $bytes = (int)$bytes;
+    if($bytes < 0) return '不限';
+    if($bytes >= 1073741824) return rtrim(rtrim(number_format($bytes / 1073741824, 2, '.', ''), '0'), '.') . ' GB';
+    if($bytes >= 1048576) return round($bytes / 1048576) . ' MB';
+    if($bytes >= 1024) return round($bytes / 1024) . ' KB';
+    return $bytes . ' B';
+};
+
+$defaultPkg = get_default_package($DB);
+$defaultStorageText = $defaultPkg ? $fmtBytes((int)$defaultPkg['storage_limit']) : '以套餐为准';
+
+$packages = [];
+$pkgRs = $DB->query("SELECT name, level, storage_limit, days, is_default FROM eecms_packages WHERE status=1 ORDER BY level ASC, id ASC");
+if($pkgRs) {
+    while($row = $DB->fetch($pkgRs)) {
+        $packages[] = $row;
     }
-    if (!$defaultValid) {
-        $defaultApi = '';
-        foreach ($apiConfig as $key => $cfg) {
-            $ek = 'api_'.$key.'_enable';
-            if (isset($conf[$ek]) && $conf[$ek] == '1') { $defaultApi = $key; break; }
-        }
-    }
+}
+if(empty($packages)) {
+    $packages[] = [
+        'name' => '默认套餐',
+        'level' => 0,
+        'storage_limit' => $defaultPkg ? (int)$defaultPkg['storage_limit'] : 0,
+        'days' => 0,
+        'is_default' => 1,
+    ];
+}
 
-    $s3Configs = array();
-    if(isset($conf['s3_storage_configs']) && !empty($conf['s3_storage_configs'])) {
-        $decoded = json_decode($conf['s3_storage_configs'], true);
-        if(is_array($decoded)) {
-            foreach($decoded as &$s3cfg) {
-                if(isset($s3cfg['secret_key'])) {
-                    $s3cfg['secret_key'] = ct_decrypt($s3cfg['secret_key']);
-                }
-            }
-            unset($s3cfg);
-            foreach($decoded as $i => $s3) {
-                if(isset($s3['enabled']) && $s3['enabled'] === '1') {
-                    $s3Configs[$i] = $s3;
-                }
-            }
-        }
-    }
-    $siteName   = isset($conf['name'])    ? $conf['name']    : '图床';
-    // 弹窗通知内容：为空则前端不弹出；配合内容哈希实现"关闭后不再弹出，直到内容变更"
-    $siteNotice = !empty($conf['jieshao']) ? $conf['jieshao'] : '';
-    $siteNoticeHash = $siteNotice !== '' ? md5($siteNotice) : '';
-    $siteWarning = !empty($conf['Copyright']) ? $conf['Copyright'] : '';
-    $siteEmail  = isset($conf['email'])  && $conf['email']  !== '' ? $conf['email']
-                : (isset($conf['picui_email']) ? $conf['picui_email'] : '');
+$primaryCtaUrl  = $isUser ? $userCenterUrl : ($isAdmin ? $loginUrl : ($regEnabled ? $registerUrl : $loginUrl));
+$primaryCtaText = $isUser ? '进入个人中心' : ($isAdmin ? '用户登录' : ($regEnabled ? '免费开始使用' : '登录后使用'));
 
-    // 登录状态（来自 member.php，通过 common.php 加载）
-    $isLoggedIn = isset($islogin) && $islogin == 1;
-
-    // ========== 访客预览模式（仅“管理员单独登录、未登录用户中心”时生效） ==========
-    // 设计意图：管理员只登录后台时，访问前端默认按访客呈现，便于验证访问控制配置。
-    // 但后台与用户中心是两套独立登录态：若管理员同时登录了用户中心，
-    // 前端应以用户身份呈现，不能再被后台登录态覆盖（两者可同时在线）。
-    $isAdminPreviewGuest = $isLoggedIn && !$isUserLoggedIn;
-
-    // ========== 套餐接口过滤 ==========
-    // 前端访问控制基于用户中心登录状态（$isUserLoggedIn）；
-    // 后台登录态不再覆盖它，仅影响 $isAdminPreviewGuest。
-    $pkgUserId = 0;
-    if($isUserLoggedIn) {
-        $pkgUserId = (int)$currentUserId;
-    }
-
-    // 获取用户可用接口列表
-    $allowedApiInfo = ['api_keys'=>[], 's3_ids'=>[]];
-    $hasApiRestriction = false;
-    if($pkgUserId >= 0) {
-        $allowedApiInfo = get_user_allowed_apis($DB, $pkgUserId);
-        // has_group=true 表示用户已绑定分组，即使分组内接口全部已关闭，
-        // 也应标记为受限，防止前端放行全部已启用接口
-        $hasApiRestriction = !empty($allowedApiInfo['api_keys']) || !empty($allowedApiInfo['s3_ids']) || !empty($allowedApiInfo['has_group']);
-    }
-
-    // 未登录用户强制隐藏本地上传
-    // 管理员只登录后台时 $isAdminPreviewGuest=true、$isUserLoggedIn=false，
-    // 因此访客预览模式同样会应用该开关；同时登录用户中心后按真实用户身份判断。
-    $guestHideLocal = isset($conf['guest_hide_local']) ? $conf['guest_hide_local'] : '0';
-    $forceHideLocal = !$isUserLoggedIn && $guestHideLocal === '1';
-
-    // 上传需要登录：后台开启 upload_require_login 且用户未登录时，
-    // 上传按钮显示「登录后开始上传」并跳转登录页，而非触发上传。
-    // 管理员仅登录后台（未登录用户中心）时同样按访客处理。
-    $uploadRequireLogin = isset($conf['upload_require_login']) ? $conf['upload_require_login'] : '0';
-    $needLoginToUpload = ($uploadRequireLogin === '1') && !$isUserLoggedIn;
-
-    // 如果默认接口被过滤掉，选一个新的
-    if($hasApiRestriction || $forceHideLocal) {
-        $defaultFiltered = false;
-        if($forceHideLocal && $defaultApi === 'local') $defaultFiltered = true;
-        if($hasApiRestriction && !in_array($defaultApi, $allowedApiInfo['api_keys'])) $defaultFiltered = true;
-        if($defaultFiltered) {
-            $defaultApi = '';
-            if($hasApiRestriction) {
-                foreach($allowedApiInfo['api_keys'] as $ak) {
-                    $ek = 'api_'.$ak.'_enable';
-                    if(isset($conf[$ek]) && $conf[$ek] == '1') { $defaultApi = $ak; break; }
-                }
-            }
-            if($defaultApi === '' && !$forceHideLocal && !$hasApiRestriction) {
-                foreach($apiConfig as $key => $cfg) {
-                    if($forceHideLocal && $key === 'local') continue;
-                    $ek = 'api_'.$key.'_enable';
-                    if(isset($conf[$ek]) && $conf[$ek] == '1') { $defaultApi = $key; break; }
-                }
-            }
-        }
-    }
+$contactEmail = trim((string)($conf['email'] ?? ''));
+$icp          = trim((string)($conf['icp'] ?? ''));
 ?>
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title><?php echo htmlspecialchars($siteName);?> - 图床上传</title>
-  <meta name="description" content="<?php echo isset($conf['description']) ? htmlspecialchars($conf['description'], ENT_QUOTES, 'UTF-8') : ''; ?>">
-  <meta name="keywords" content="<?php echo isset($conf['keywords']) ? htmlspecialchars($conf['keywords'], ENT_QUOTES, 'UTF-8') : ''; ?>">
-  <link href="admin/style/css/materialdesignicons.min.css" rel="stylesheet">
-  <link href="bd/qd.css" rel="stylesheet">
-  <style>
-    /* ============ 暗色主题 ============ */
-    [data-theme="dark"]{
-      --bg:#0d0b16;
-      --panel:rgba(30,26,46,0.72);
-      --panel-strong:rgba(30,26,46,0.92);
-      --line:rgba(123,140,255,0.16);
-      --text:#f0edf8;
-      --muted:#8a85a0;
-      --shadow:0 20px 60px rgba(0,0,0,0.3);
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title><?php echo htmlspecialchars($siteName, ENT_QUOTES, 'UTF-8');?> — 多图床聚合上传与图片管理</title>
+<meta name="description" content="<?php echo htmlspecialchars($siteName, ENT_QUOTES, 'UTF-8');?> 内置 <?php echo (int)$apiCount;?> 个图床接口，支持本地上传与自定义 S3 存储，提供网页上传、用户中心与 API 密钥上传。">
+<link rel="icon" type="image/x-icon" href="<?php echo htmlspecialchars(site_favicon_href(), ENT_QUOTES, 'UTF-8');?>">
+<style>
+  /* ============================================================
+     1. Design Tokens
+     ============================================================ */
+  :root {
+    /* 中性色 */
+    --ink: #0C1017;
+    --ink-soft: #1B2230;
+    --body: #4B5565;
+    --muted: #6F7889;
+    --line: #E7E9EE;
+    --line-strong: #D9DDE6;
+    --bg: #FFFFFF;
+    --bg-soft: #F6F7FA;
+    --bg-tint: #F1F2FC;
+
+    /* 品牌色 */
+    --brand: #4F46E5;
+    --brand-deep: #4338CA;
+    --brand-soft: #EEF0FF;
+    --violet: #7C3AED;
+    --cyan: #06B6D4;
+    --green: #0E9F6E;
+    --amber: #F59E0B;
+    --grad: linear-gradient(112deg, #4F46E5 0%, #7C3AED 55%, #06B6D4 100%);
+    --grad-soft: linear-gradient(140deg, #F4F4FF 0%, #F8F5FF 45%, #EFFBFF 100%);
+
+    /* 字体 */
+    --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "HarmonyOS Sans SC",
+      "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    --mono: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+
+    /* 圆角与阴影 */
+    --r-sm: 8px;
+    --r-md: 12px;
+    --r-lg: 16px;
+    --r-xl: 22px;
+    --r-2xl: 28px;
+    --r-full: 999px;
+    --sh-sm: 0 1px 2px rgba(16, 24, 40, .05);
+    --sh-card: 0 1px 2px rgba(16, 24, 40, .04), 0 10px 28px -16px rgba(16, 24, 40, .16);
+    --sh-lift: 0 2px 4px rgba(16, 24, 40, .04), 0 28px 56px -28px rgba(30, 34, 80, .35);
+
+    /* 动效 */
+    --ease: cubic-bezier(.22, .61, .36, 1);
+    --ease-out: cubic-bezier(0, 0, .2, 1);
+  }
+
+  /* ============================================================
+     2. Reset & Base
+     ============================================================ */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: var(--font);
+    font-size: 16px;
+    line-height: 1.7;
+    color: var(--ink);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: clip;
+  }
+  h1, h2, h3, h4 { font-weight: 800; line-height: 1.24; letter-spacing: -.02em; }
+  p { color: var(--body); }
+  a { color: inherit; text-decoration: none; }
+  img, svg { display: block; }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  ul { list-style: none; }
+  kbd {
+    font-family: var(--mono); font-size: .78em; padding: 2px 6px;
+    border: 1px solid var(--line-strong); border-bottom-width: 2px;
+    border-radius: 5px; background: #fff; color: var(--ink-soft); white-space: nowrap;
+  }
+  :focus-visible { outline: 2px solid var(--brand); outline-offset: 3px; border-radius: 4px; }
+  ::selection { background: rgba(79, 70, 229, .16); }
+
+  .container { width: 100%; max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+  .section { padding: 108px 0; position: relative; }
+  .section--soft { background: var(--bg-soft); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .section[id], section[id] { scroll-margin-top: 88px; }
+
+  /* 区块标题 */
+  .sec-head { max-width: 660px; margin: 0 auto 60px; text-align: center; }
+  .sec-head--left { margin-left: 0; text-align: left; }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--brand); margin-bottom: 18px;
+  }
+  .eyebrow::before {
+    content: ""; width: 18px; height: 2px; border-radius: 2px; background: var(--grad);
+  }
+  .sec-head h2 { font-size: clamp(1.85rem, 3.4vw, 2.6rem); margin-bottom: 16px; }
+  .sec-head p { font-size: 1.0625rem; line-height: 1.8; }
+
+  /* 按钮 */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+    padding: 13px 24px; border-radius: var(--r-md);
+    font-size: .95rem; font-weight: 650; letter-spacing: -.01em;
+    transition: transform .18s var(--ease), box-shadow .24s var(--ease),
+                background-color .18s var(--ease), border-color .18s var(--ease), color .18s var(--ease);
+    white-space: nowrap;
+  }
+  .btn svg { width: 17px; height: 17px; flex: none; }
+  .btn--primary {
+    color: #fff; background: var(--brand);
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .12), 0 10px 24px -10px rgba(79, 70, 229, .6);
+  }
+  .btn--primary:hover {
+    background: var(--brand-deep); transform: translateY(-2px);
+    box-shadow: 0 2px 4px rgba(16, 24, 40, .1), 0 18px 34px -14px rgba(79, 70, 229, .7);
+  }
+  .btn--ghost {
+    color: var(--ink); background: #fff; border: 1px solid var(--line-strong);
+    box-shadow: var(--sh-sm);
+  }
+  .btn--ghost:hover { border-color: #BFC5D2; transform: translateY(-2px); box-shadow: var(--sh-card); }
+  .btn--lg { padding: 15px 28px; font-size: 1rem; border-radius: 14px; }
+  .btn--white { background: #fff; color: var(--ink); box-shadow: 0 10px 30px -12px rgba(0, 0, 0, .45); }
+  .btn--white:hover { transform: translateY(-2px); box-shadow: 0 18px 40px -14px rgba(0, 0, 0, .5); }
+  .btn--onDark {
+    color: #fff; border: 1px solid rgba(255, 255, 255, .28); background: rgba(255, 255, 255, .08);
+    backdrop-filter: blur(8px);
+  }
+  .btn--onDark:hover { background: rgba(255, 255, 255, .16); border-color: rgba(255, 255, 255, .45); transform: translateY(-2px); }
+
+  /* 滚动进场 */
+  .reveal { opacity: 0; transform: translateY(22px); transition: opacity .7s var(--ease-out), transform .7s var(--ease-out); }
+  .reveal.is-in { opacity: 1; transform: none; }
+
+  /* ============================================================
+     3. 顶部公告条
+     ============================================================ */
+  .announce {
+    background: #0B0F18;
+    color: #C9D0DE;
+    font-size: 13px;
+    letter-spacing: .01em;
+  }
+  .announce-inner {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    padding: 9px 24px; flex-wrap: wrap; text-align: center;
+  }
+  .pill-new {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 2px 9px; border-radius: var(--r-full);
+    font-size: 11px; font-weight: 700; letter-spacing: .04em;
+    color: #C7C9FF; background: rgba(99, 102, 241, .18);
+    border: 1px solid rgba(129, 140, 248, .3);
+  }
+  .announce a { color: #fff; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
+  .announce a:hover { color: #C7C9FF; }
+  .announce a svg { width: 13px; height: 13px; }
+
+  /* ============================================================
+     4. 导航
+     ============================================================ */
+  .nav {
+    position: sticky; top: 0; z-index: 90;
+    background: rgba(255, 255, 255, .82);
+    backdrop-filter: saturate(180%) blur(16px);
+    -webkit-backdrop-filter: saturate(180%) blur(16px);
+    border-bottom: 1px solid transparent;
+    transition: border-color .25s var(--ease), box-shadow .25s var(--ease), background-color .25s var(--ease);
+  }
+  .nav.is-stuck { border-bottom-color: var(--line); box-shadow: 0 8px 24px -18px rgba(16, 24, 40, .5); }
+  .nav-inner {
+    max-width: 1200px; margin: 0 auto; padding: 0 24px;
+    height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 24px;
+  }
+  .logo { display: inline-flex; align-items: center; gap: 10px; flex: none; }
+  .logo-mark {
+    width: 32px; height: 32px; border-radius: 9px;
+    background: var(--grad); display: grid; place-items: center;
+    box-shadow: 0 6px 14px -6px rgba(79, 70, 229, .8);
+  }
+  .logo-mark svg { width: 19px; height: 19px; }
+  .logo-text { font-size: 17px; font-weight: 800; letter-spacing: -.03em; }
+  .logo-text em {
+    font-style: normal; font-size: 12px; font-weight: 600; color: var(--muted);
+    letter-spacing: .06em; margin-left: 6px; text-transform: uppercase;
+  }
+  .nav-links { display: flex; align-items: center; gap: 4px; margin-left: 12px; margin-right: auto; }
+  .nav-links a {
+    padding: 8px 12px; border-radius: var(--r-sm);
+    font-size: 14px; font-weight: 550; color: var(--body);
+    transition: color .16s, background-color .16s;
+  }
+  .nav-links a:hover { color: var(--ink); background: var(--bg-soft); }
+  .nav-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+  .nav-login { padding: 9px 14px; font-size: 14px; font-weight: 600; color: var(--body); border-radius: var(--r-sm); }
+  .nav-login:hover { color: var(--ink); background: var(--bg-soft); }
+  .nav-actions .btn { padding: 9px 16px; font-size: 13.5px; border-radius: 10px; }
+  .nav-toggle { display: none; width: 40px; height: 40px; border-radius: 10px; place-items: center; }
+  .nav-toggle:hover { background: var(--bg-soft); }
+  .nav-toggle span { display: block; width: 18px; height: 1.8px; background: var(--ink); border-radius: 2px; transition: transform .3s var(--ease), opacity .2s; }
+  .nav-toggle span + span { margin-top: 4px; }
+  .nav-toggle[aria-expanded="true"] span:nth-child(1) { transform: translateY(5.8px) rotate(45deg); }
+  .nav-toggle[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
+  .nav-toggle[aria-expanded="true"] span:nth-child(3) { transform: translateY(-5.8px) rotate(-45deg); }
+  .nav-mobile {
+    display: none; padding: 8px 24px 22px;
+    border-top: 1px solid var(--line); background: #fff;
+  }
+  .nav-mobile.is-open { display: block; }
+  .nav-mobile a {
+    display: block; padding: 13px 4px; font-size: 15px; font-weight: 550;
+    color: var(--ink-soft); border-bottom: 1px solid var(--line);
+  }
+  .nav-mobile .btn { width: 100%; margin-top: 16px; }
+
+  /* ============================================================
+     5. Hero
+     ============================================================ */
+  .hero {
+    position: relative; overflow: hidden;
+    padding: 84px 0 92px;
+    background:
+      radial-gradient(900px 480px at 82% -8%, rgba(124, 58, 237, .13), transparent 62%),
+      radial-gradient(760px 420px at 6% 4%, rgba(6, 182, 212, .10), transparent 60%),
+      linear-gradient(180deg, #FBFBFF 0%, #FFFFFF 72%);
+  }
+  .hero::before {
+    content: ""; position: absolute; inset: 0;
+    background-image: linear-gradient(to right, rgba(15, 23, 42, .045) 1px, transparent 1px),
+                      linear-gradient(to bottom, rgba(15, 23, 42, .045) 1px, transparent 1px);
+    background-size: 68px 68px;
+    mask-image: radial-gradient(620px 340px at 50% 0%, #000 0%, transparent 78%);
+    -webkit-mask-image: radial-gradient(620px 340px at 50% 0%, #000 0%, transparent 78%);
+    pointer-events: none;
+  }
+  .hero-inner {
+    position: relative; z-index: 1;
+    display: grid; grid-template-columns: minmax(0, 1.02fr) minmax(0, .98fr);
+    gap: 56px; align-items: center;
+  }
+  .hero-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 6px 6px 12px; border-radius: var(--r-full);
+    background: #fff; border: 1px solid var(--line);
+    box-shadow: 0 2px 8px -4px rgba(16, 24, 40, .16);
+    font-size: 12.5px; font-weight: 600; color: var(--ink-soft);
+    margin-bottom: 26px;
+  }
+  .hero-badge .tag {
+    padding: 2px 8px; border-radius: var(--r-full);
+    background: var(--grad); color: #fff; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  }
+  .hero h1 {
+    font-size: clamp(2.35rem, 4.5vw, 3.55rem);
+    line-height: 1.14; letter-spacing: -.035em; margin-bottom: 22px;
+  }
+  .grad-text {
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; color: var(--brand);
+  }
+  .hero-sub {
+    font-size: 1.0625rem; line-height: 1.85; color: var(--body);
+    max-width: 520px; margin-bottom: 32px;
+  }
+  .hero-sub strong { color: var(--ink-soft); font-weight: 650; }
+  .hero-cta { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 26px; }
+  .hero-note { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--muted); }
+  .hero-note span { display: inline-flex; align-items: center; gap: 6px; }
+  .hero-note svg { width: 14px; height: 14px; color: var(--green); flex: none; }
+
+  /* Hero 右侧控制台 */
+  .hero-visual { position: relative; }
+  .hero-visual::before {
+    content: ""; position: absolute; inset: 10% -5% -9% 6%; z-index: 0;
+    background: linear-gradient(135deg, rgba(79, 70, 229, .4), rgba(6, 182, 212, .34));
+    filter: blur(42px); opacity: .55; border-radius: 44px;
+  }
+  .console {
+    position: relative; z-index: 2;
+    background: #fff; border: 1px solid var(--line);
+    border-radius: var(--r-xl); overflow: hidden;
+    box-shadow: 0 2px 6px rgba(16, 24, 40, .05), 0 40px 80px -40px rgba(40, 44, 90, .45);
+  }
+  .console-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 14px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #FCFCFE, #F7F8FC);
+  }
+  .dots { display: flex; gap: 5px; }
+  .dots i { width: 8px; height: 8px; border-radius: 50%; background: #E1E4EC; }
+  .dots i:first-child { background: #FCA5A5; }
+  .dots i:nth-child(2) { background: #FCD34D; }
+  .dots i:nth-child(3) { background: #86EFAC; }
+  .console-url {
+    flex: 1; text-align: center; font-family: var(--mono); font-size: 11px;
+    color: var(--muted); background: #fff; border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .console-secure { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 700; color: var(--green); letter-spacing: .04em; }
+  .console-secure svg { width: 11px; height: 11px; }
+
+  .dropzone {
+    margin: 18px 18px 0; padding: 26px 18px;
+    border: 1.5px dashed #CFD4E4; border-radius: var(--r-lg);
+    background: linear-gradient(180deg, #FAFAFF, #F8F9FE 100%);
+    text-align: center; transition: border-color .2s, background-color .2s;
+  }
+  .dropzone:hover { border-color: #A5AAFF; background: #F7F7FF; }
+  .dz-icon {
+    width: 42px; height: 42px; margin: 0 auto 12px; border-radius: 12px;
+    display: grid; place-items: center; color: var(--brand);
+    background: #fff; border: 1px solid #E4E4FB;
+    box-shadow: 0 8px 18px -12px rgba(79, 70, 229, .7);
+  }
+  .dz-icon svg { width: 21px; height: 21px; }
+  .dz-title { font-size: 14px; font-weight: 700; color: var(--ink); margin-bottom: 4px; }
+  .dz-sub { font-size: 11.5px; color: var(--muted); }
+
+  .filelist { padding: 14px 18px 4px; display: grid; gap: 10px; }
+  .file {
+    display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px;
+    padding: 8px; border-radius: 10px; border: 1px solid var(--line);
+    background: #fff; transition: border-color .2s, box-shadow .2s;
+  }
+  .file:hover { border-color: #D5D8E8; box-shadow: var(--sh-sm); }
+  .file-thumb { width: 32px; height: 32px; border-radius: 7px; background-image: var(--img); background-size: cover; }
+  .file-name {
+    font-size: 11.5px; font-weight: 650; color: var(--ink-soft);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .file-meta { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+  .bar { height: 3px; border-radius: 3px; background: #EEF0F6; overflow: hidden; margin-top: 5px; }
+  .bar span {
+    display: block; height: 100%; width: var(--w); border-radius: 3px;
+    background: var(--grad); transform-origin: left; animation: fill 1.5s var(--ease-out) both;
+  }
+  @keyframes fill { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+  .file-state {
+    font-size: 10px; font-weight: 700; color: var(--green);
+    display: inline-flex; align-items: center; gap: 3px;
+  }
+  .file-state svg { width: 11px; height: 11px; }
+  .file-state.is-syncing { color: var(--brand); }
+  .file-state .spin { width: 10px; height: 10px; border: 1.5px solid #C7C9FF; border-top-color: var(--brand); border-radius: 50%; animation: spin .9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .console-foot {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 12px 18px 15px; margin-top: 10px; border-top: 1px solid var(--line);
+    background: #FCFCFE;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: var(--r-full);
+    font-size: 10.5px; font-weight: 600; color: var(--body);
+    background: #fff; border: 1px solid var(--line); white-space: nowrap;
+  }
+  .chip svg { width: 11px; height: 11px; color: var(--brand); }
+  .chip--ok { color: #067A55; background: #ECFDF5; border-color: #C7F0DF; }
+  .chip--ok svg { color: var(--green); }
+
+  /* 浮动小卡 */
+  .float-card {
+    position: absolute; z-index: 3;
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 13px; border-radius: 12px;
+    background: rgba(255, 255, 255, .94);
+    border: 1px solid var(--line);
+    box-shadow: 0 14px 34px -18px rgba(16, 24, 40, .4);
+    backdrop-filter: blur(10px);
+    font-size: 11.5px; font-weight: 650; color: var(--ink-soft);
+    animation: bob 6s ease-in-out infinite;
+  }
+  .float-card svg { width: 14px; height: 14px; }
+  .float-a { top: -18px; left: -26px; }
+  .float-a .live { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(14, 159, 110, .16); }
+  .float-b { bottom: -20px; right: -18px; animation-delay: -3s; color: var(--ink); }
+  .float-b svg { color: var(--brand); }
+  @keyframes bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+
+  /* ============================================================
+     6. 存储源跑马灯
+     ============================================================ */
+  .providers { padding: 40px 0 44px; border-bottom: 1px solid var(--line); background: #fff; }
+  .providers-label {
+    text-align: center; font-size: 12.5px; font-weight: 600; color: var(--muted);
+    letter-spacing: .04em; margin-bottom: 26px;
+  }
+  .marquee { overflow: hidden; mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent); }
+  .marquee-track { display: flex; width: max-content; animation: slide 34s linear infinite; }
+  .marquee:hover .marquee-track { animation-play-state: paused; }
+  @keyframes slide { to { transform: translateX(-50%); } }
+  .prov-set { display: flex; align-items: center; gap: 46px; padding-right: 46px; }
+  .prov {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 15px; font-weight: 700; color: #97A0AF;
+    letter-spacing: -.01em; white-space: nowrap;
+    transition: color .2s;
+  }
+  .prov:hover { color: var(--ink); }
+  .prov i { width: 6px; height: 6px; border-radius: 2px; background: currentColor; opacity: .55; }
+
+  /* ============================================================
+     7. 数据条
+     ============================================================ */
+  .stats { padding: 54px 0; background: #fff; }
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    border: 1px solid var(--line); border-radius: var(--r-xl);
+    background: linear-gradient(180deg, #FDFDFF, #FAFAFD);
+    overflow: hidden;
+  }
+  .stat { padding: 30px 26px; border-left: 1px solid var(--line); }
+  .stat:first-child { border-left: none; }
+  .stat-num {
+    font-size: clamp(1.7rem, 2.7vw, 2.15rem); font-weight: 800; letter-spacing: -.04em;
+    line-height: 1.1; color: var(--ink); font-variant-numeric: tabular-nums;
+    display: flex; align-items: baseline; gap: 2px;
+  }
+  .stat-num em { font-style: normal; font-size: .55em; font-weight: 700; color: var(--brand); }
+  .stat-label { margin-top: 8px; font-size: 13px; color: var(--body); }
+
+  /* ============================================================
+     8. Bento 功能区
+     ============================================================ */
+  .bento {
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 18px;
+  }
+  .bcard {
+    grid-column: span 2;
+    position: relative; overflow: hidden;
+    padding: 28px; border-radius: var(--r-xl);
+    background: #fff; border: 1px solid var(--line);
+    box-shadow: var(--sh-sm);
+    transition: transform .3s var(--ease), box-shadow .3s var(--ease), border-color .3s;
+    display: flex; flex-direction: column;
+  }
+  .bcard:hover { transform: translateY(-3px); box-shadow: var(--sh-lift); border-color: #DFE2EE; }
+  .bcard--4 { grid-column: span 4; }
+  .bcard--3 { grid-column: span 3; }
+  .bcard--accent { background: var(--grad-soft); border-color: #E4E3FA; }
+  .bcard-icon {
+    width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center;
+    background: var(--brand-soft); color: var(--brand); margin-bottom: 18px;
+    border: 1px solid #E3E3FC;
+  }
+  .bcard-icon svg { width: 18px; height: 18px; }
+  .bcard h3 { font-size: 1.0625rem; font-weight: 750; margin-bottom: 8px; letter-spacing: -.015em; }
+  .bcard p { font-size: 13.5px; line-height: 1.75; color: var(--body); }
+
+  /* 卡片内可视化：存储节点 */
+  .nodes {
+    margin-top: 20px; display: grid; gap: 7px; padding: 12px;
+    border-radius: 12px; background: #fff; border: 1px solid var(--line);
+    box-shadow: var(--sh-sm);
+  }
+  .node {
+    display: flex; align-items: center; gap: 9px;
+    font-size: 11.5px; font-weight: 600; color: var(--body);
+    padding: 6px 8px; border-radius: 7px;
+  }
+  .node.is-active { background: #F6F6FF; color: var(--ink); box-shadow: inset 0 0 0 1px #E6E5FC; }
+  .node-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex: none; }
+  .node-dot.warn { background: var(--amber); }
+  .node-dot.off { background: #CBD2DE; }
+  .node-name { flex: 1; }
+  .node-latency { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+  .node-flag {
+    font-size: 9px; font-weight: 800; letter-spacing: .06em; color: var(--brand);
+    background: #EEEEFF; padding: 1px 6px; border-radius: 4px;
+  }
+
+  /* 卡片内可视化：压缩对比 */
+  .compress { margin-top: 20px; display: grid; gap: 9px; }
+  .cbar-row { display: flex; align-items: center; gap: 8px; font-size: 10.5px; color: var(--muted); font-family: var(--mono); }
+  .cbar { height: 7px; border-radius: 4px; background: #EDEFF5; flex: 1; overflow: hidden; }
+  .cbar i { display: block; height: 100%; border-radius: 4px; width: var(--w); }
+  .cbar i.raw { background: #D8DCE6; }
+  .cbar i.out { background: var(--grad); }
+  .save-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    margin-top: 4px; align-self: flex-start;
+    font-size: 11px; font-weight: 700; color: #067A55;
+    background: #ECFDF5; border: 1px solid #C7F0DF; padding: 3px 9px; border-radius: var(--r-full);
+  }
+
+  /* 卡片内可视化：代码 */
+  .mini-code {
+    margin-top: 20px; border-radius: 12px; overflow: hidden;
+    background: #0D1117; border: 1px solid #1E2532;
+    font-family: var(--mono); font-size: 10.5px; line-height: 1.9;
+  }
+  .mini-code-bar { display: flex; gap: 4px; padding: 7px 10px; border-bottom: 1px solid #1B2130; }
+  .mini-code-bar i { width: 6px; height: 6px; border-radius: 50%; background: #2C3444; }
+  .mini-code pre { padding: 10px 12px; overflow: hidden; color: #C9D1D9; }
+  .mini-code .k { color: #C792EA; }
+  .mini-code .s { color: #9AE6B4; }
+  .mini-code .c { color: #5B6474; }
+  .mini-code .f { color: #82AAFF; }
+  .mini-code .p { color: #7D8799; }
+
+  /* 卡片内可视化：域名标签 */
+  .domain-stack { margin-top: 20px; display: grid; gap: 8px; }
+  .domain-chip {
+    display: flex; align-items: center; gap: 9px;
+    padding: 9px 12px; border-radius: 10px; background: #fff;
+    border: 1px solid var(--line); font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
+    box-shadow: var(--sh-sm);
+  }
+  .domain-chip svg { width: 13px; height: 13px; color: var(--green); flex: none; }
+  .domain-chip span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .domain-chip b { font-family: var(--font); font-size: 9px; font-weight: 800; letter-spacing: .05em; color: var(--muted); }
+
+  /* 卡片内可视化：防护标签 */
+  .guard-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 18px; }
+  .guard-tags span {
+    font-size: 10.5px; font-weight: 600; color: var(--body);
+    padding: 4px 9px; border-radius: 6px; background: var(--bg-soft);
+    border: 1px solid var(--line);
+  }
+
+  /* ============================================================
+     9. 三步接入
+     ============================================================ */
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; counter-reset: step; }
+  .step {
+    position: relative; padding: 30px 26px 28px;
+    border-radius: var(--r-xl); background: #fff;
+    border: 1px solid var(--line); box-shadow: var(--sh-sm);
+  }
+  .step::after {
+    content: ""; position: absolute; top: 46px; right: -14px; width: 8px; height: 8px;
+    border-top: 1.5px solid var(--line-strong); border-right: 1.5px solid var(--line-strong);
+    transform: rotate(45deg);
+  }
+  .step:last-child::after { display: none; }
+  .step-num {
+    font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .1em;
+    color: var(--brand); background: var(--brand-soft);
+    display: inline-block; padding: 3px 9px; border-radius: 6px; margin-bottom: 16px;
+  }
+  .step h3 { font-size: 1.0625rem; margin-bottom: 8px; }
+  .step p { font-size: 13.5px; line-height: 1.75; }
+  .step-code {
+    margin-top: 16px; display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
+    background: var(--bg-soft); border: 1px solid var(--line);
+    padding: 6px 10px; border-radius: 7px;
+  }
+  .step-code i { width: 5px; height: 5px; border-radius: 50%; background: var(--green); }
+
+  /* ============================================================
+     10. API 区
+     ============================================================ */
+  .api-wrap { display: grid; grid-template-columns: .9fr 1.1fr; gap: 56px; align-items: center; }
+  .api-copy h2 { font-size: clamp(1.8rem, 3.2vw, 2.4rem); margin-bottom: 16px; }
+  .api-copy > p { font-size: 1rem; line-height: 1.85; margin-bottom: 26px; }
+  .api-list { display: grid; gap: 14px; margin-bottom: 30px; }
+  .api-list li { display: flex; gap: 12px; align-items: flex-start; }
+  .api-list .tick {
+    width: 20px; height: 20px; border-radius: 50%; flex: none; margin-top: 2px;
+    display: grid; place-items: center; background: #ECFDF5; color: #067A55;
+    border: 1px solid #C7F0DF;
+  }
+  .api-list .tick svg { width: 11px; height: 11px; }
+  .api-list strong { display: block; font-size: 14px; font-weight: 700; color: var(--ink); margin-bottom: 1px; }
+  .api-list span { font-size: 13px; color: var(--body); line-height: 1.65; }
+  .api-clients { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .api-clients b {
+    font-weight: 650; font-size: 11.5px; color: var(--ink-soft);
+    padding: 3px 9px; border-radius: 6px; background: #fff; border: 1px solid var(--line);
+  }
+
+  .codebox {
+    border-radius: var(--r-lg); overflow: hidden;
+    background: #0B0F18; border: 1px solid #1B2230;
+    box-shadow: 0 30px 60px -34px rgba(11, 15, 24, .7);
+  }
+  .codebox-head {
+    display: flex; align-items: center; gap: 6px;
+    padding: 9px 12px; border-bottom: 1px solid #1B2230; background: #0E131D;
+  }
+  .tabs { display: flex; gap: 2px; }
+  .tab {
+    padding: 6px 12px; border-radius: 7px;
+    font-family: var(--mono); font-size: 11px; font-weight: 600;
+    color: #77839A; transition: color .16s, background-color .16s;
+  }
+  .tab:hover { color: #C9D1D9; background: rgba(255, 255, 255, .05); }
+  .tab[aria-selected="true"] { color: #fff; background: rgba(255, 255, 255, .1); }
+  .copy-btn {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 5px;
+    padding: 5px 9px; border-radius: 6px; font-size: 10.5px; font-weight: 600;
+    color: #8B97AC; border: 1px solid #232B3A; transition: all .16s;
+  }
+  .copy-btn:hover { color: #fff; border-color: #3A465C; background: rgba(255, 255, 255, .05); }
+  .copy-btn svg { width: 11px; height: 11px; }
+  .code-body { position: relative; }
+  .code-panel { display: none; padding: 18px 20px 22px; overflow-x: auto; }
+  .code-panel.is-active { display: block; }
+  .code-panel pre { font-family: var(--mono); font-size: 12px; line-height: 1.95; color: #C9D1D9; }
+  .code-panel .k { color: #C792EA; }
+  .code-panel .s { color: #9AE6B4; }
+  .code-panel .c { color: #5B6474; font-style: italic; }
+  .code-panel .f { color: #82AAFF; }
+  .code-panel .n { color: #F78C6C; }
+  .code-panel .p { color: #7D8799; }
+  .code-panel .v { color: #E2E8F0; }
+
+  /* ============================================================
+     11. 图片流
+     ============================================================ */
+  .flow { overflow: hidden; }
+  .flow-rows { display: grid; gap: 16px; margin-top: 12px; }
+  .flow-row {
+    overflow: hidden;
+    mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+  }
+  .flow-track { display: flex; width: max-content; gap: 16px; animation: slideFlow 48s linear infinite; }
+  .flow-row--rev .flow-track { animation-direction: reverse; animation-duration: 58s; }
+  .flow-row:hover .flow-track { animation-play-state: paused; }
+  /* 位移 = 半组宽度 + 半个 gap，保证无缝循环 */
+  @keyframes slideFlow { to { transform: translateX(calc(-50% - 8px)); } }
+  .shot {
+    position: relative; width: 236px; height: 158px; flex: none;
+    border-radius: 14px; overflow: hidden;
+    border: 1px solid rgba(16, 24, 40, .08);
+    transition: transform .35s var(--ease), box-shadow .35s var(--ease);
+  }
+  .shot:hover { transform: scale(1.03); box-shadow: 0 22px 40px -20px rgba(16, 24, 40, .5); }
+  .shot::before { content: ""; position: absolute; inset: 0; background-image: var(--img); }
+  .shot::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(180deg, transparent 40%, rgba(8, 12, 20, .72) 100%);
+    opacity: .9;
+  }
+  .shot-info {
+    position: absolute; left: 12px; right: 12px; bottom: 10px; z-index: 1;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  .shot-name {
+    font-family: var(--mono); font-size: 10.5px; color: rgba(255, 255, 255, .95);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500;
+  }
+  .shot-tag {
+    font-size: 9px; font-weight: 800; letter-spacing: .05em;
+    color: #0B0F18; background: rgba(255, 255, 255, .92);
+    padding: 2px 6px; border-radius: 4px; flex: none;
+  }
+  .flow-note { text-align: center; font-size: 13px; color: var(--muted); margin-top: 36px; }
+  .flow-note b { color: var(--ink-soft); font-weight: 650; }
+
+  /* 抽象图渐变 */
+  .g1 { --img: radial-gradient(circle at 22% 18%, #FDE68A, transparent 55%), radial-gradient(circle at 78% 72%, #FB7185, transparent 58%), linear-gradient(135deg, #6366F1, #0EA5E9); }
+  .g2 { --img: radial-gradient(circle at 70% 22%, #A7F3D0, transparent 55%), radial-gradient(circle at 24% 82%, #38BDF8, transparent 52%), linear-gradient(160deg, #064E3B, #065F46); }
+  .g3 { --img: radial-gradient(circle at 30% 74%, #FDBA74, transparent 52%), radial-gradient(circle at 80% 26%, #F472B6, transparent 56%), linear-gradient(135deg, #4C1D95, #1E1B4B); }
+  .g4 { --img: radial-gradient(circle at 26% 24%, #BFDBFE, transparent 52%), radial-gradient(circle at 74% 78%, #C4B5FD, transparent 56%), linear-gradient(135deg, #1E3A8A, #312E81); }
+  .g5 { --img: radial-gradient(circle at 68% 30%, #FEF08A, transparent 50%), radial-gradient(circle at 22% 80%, #F97316, transparent 54%), linear-gradient(150deg, #7F1D1D, #B45309); }
+  .g6 { --img: radial-gradient(circle at 32% 30%, #99F6E4, transparent 55%), radial-gradient(circle at 76% 74%, #6EE7B7, transparent 52%), linear-gradient(140deg, #0F766E, #134E4A); }
+  .g7 { --img: radial-gradient(circle at 74% 24%, #DDD6FE, transparent 54%), radial-gradient(circle at 20% 76%, #F9A8D4, transparent 52%), linear-gradient(135deg, #312E81, #701A75); }
+  .g8 { --img: radial-gradient(circle at 24% 30%, #FECDD3, transparent 52%), radial-gradient(circle at 72% 72%, #FDA4AF, transparent 56%), linear-gradient(130deg, #881337, #4C0519); }
+  .g9 { --img: radial-gradient(circle at 64% 26%, #BAE6FD, transparent 54%), radial-gradient(circle at 26% 74%, #93C5FD, transparent 52%), linear-gradient(135deg, #1D4ED8, #172554); }
+  .g10 { --img: radial-gradient(circle at 30% 26%, #FEF3C7, transparent 55%), radial-gradient(circle at 76% 76%, #D9F99D, transparent 50%), linear-gradient(135deg, #3F6212, #14532D); }
+  .g11 { --img: radial-gradient(circle at 70% 30%, #E9D5FF, transparent 54%), radial-gradient(circle at 28% 78%, #A78BFA, transparent 54%), linear-gradient(150deg, #4C1D95, #1E3A8A); }
+  .g12 { --img: radial-gradient(circle at 26% 26%, #FBCFE8, transparent 52%), radial-gradient(circle at 74% 74%, #FDBA74, transparent 52%), linear-gradient(135deg, #9D174D, #7C2D12); }
+
+  /* ============================================================
+     12. 价格
+     ============================================================ */
+  .price-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; align-items: start; }
+  .price-grid--two { grid-template-columns: repeat(2, minmax(0, 380px)); justify-content: center; }
+  .plan {
+    position: relative; padding: 30px 26px 28px;
+    background: #fff; border: 1px solid var(--line); border-radius: var(--r-xl);
+    box-shadow: var(--sh-sm);
+    transition: transform .3s var(--ease), box-shadow .3s var(--ease);
+  }
+  .plan:hover { transform: translateY(-3px); box-shadow: var(--sh-lift); }
+  .plan--pro {
+    background: linear-gradient(180deg, #12141C 0%, #0B0F18 100%);
+    border-color: #232A3A; color: #fff;
+    box-shadow: 0 30px 60px -32px rgba(11, 15, 24, .8);
+  }
+  .plan--pro h3, .plan--pro .plan-price { color: #fff; }
+  .plan--pro .plan-desc, .plan--pro .plan-features li { color: #A6B0C3; }
+  .plan--pro .plan-features li svg { color: #7DE2B8; }
+  .plan-badge {
+    position: absolute; top: -11px; right: 22px;
+    font-size: 10px; font-weight: 800; letter-spacing: .06em;
+    color: #fff; background: var(--grad); padding: 4px 10px; border-radius: var(--r-full);
+    box-shadow: 0 8px 18px -8px rgba(79, 70, 229, .9);
+  }
+  .plan-name { font-size: 12px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--brand); margin-bottom: 10px; }
+  .plan--pro .plan-name { color: #A5B4FC; }
+  .plan h3 { font-size: 1.25rem; margin-bottom: 6px; letter-spacing: -.02em; }
+  .plan-desc { font-size: 13px; color: var(--body); margin-bottom: 22px; min-height: 20px; }
+  .plan-price { display: flex; align-items: baseline; gap: 4px; margin-bottom: 4px; }
+  .plan-price b { font-size: 2.4rem; font-weight: 800; letter-spacing: -.04em; line-height: 1; }
+  .plan-price span { font-size: 13px; color: var(--muted); font-weight: 500; }
+  .plan--pro .plan-price span { color: #7A879E; }
+  .plan--pro .plan-year { color: #7A879E; }
+  .plan-year { font-size: 11.5px; color: var(--muted); margin-bottom: 22px; }
+  .plan .btn { width: 100%; margin-bottom: 24px; }
+  .plan-features { display: grid; gap: 11px; padding-top: 22px; border-top: 1px solid var(--line); }
+  .plan--pro .plan-features { border-top-color: #232A3A; }
+  .plan-features li { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; color: var(--body); line-height: 1.6; }
+  .plan-features svg { width: 14px; height: 14px; flex: none; margin-top: 2px; color: var(--brand); }
+  .plan-features .off { color: var(--muted); opacity: .65; }
+  .plan-features .off svg { color: #CBD2DE; }
+
+  /* ============================================================
+     13. FAQ
+     ============================================================ */
+  .faq-wrap { display: grid; grid-template-columns: .72fr 1.28fr; gap: 56px; align-items: start; }
+  .faq-list { border-top: 1px solid var(--line); }
+  .faq-item { border-bottom: 1px solid var(--line); }
+  .faq-q {
+    width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 20px;
+    padding: 21px 2px; text-align: left;
+    font-size: 15px; font-weight: 650; color: var(--ink); letter-spacing: -.01em;
+    transition: color .16s;
+  }
+  .faq-q:hover { color: var(--brand); }
+  .faq-q .ico {
+    position: relative; width: 20px; height: 20px; flex: none;
+    border-radius: 50%; border: 1px solid var(--line-strong);
+    transition: transform .3s var(--ease), border-color .2s, background-color .2s;
+  }
+  .faq-q .ico::before, .faq-q .ico::after {
+    content: ""; position: absolute; top: 50%; left: 50%; background: var(--body);
+    transform: translate(-50%, -50%); transition: background-color .2s, opacity .2s;
+  }
+  .faq-q .ico::before { width: 9px; height: 1.4px; }
+  .faq-q .ico::after { width: 1.4px; height: 9px; }
+  .faq-item[open] .faq-q .ico { transform: rotate(90deg); background: var(--brand); border-color: var(--brand); }
+  .faq-item[open] .faq-q .ico::before, .faq-item[open] .faq-q .ico::after { background: #fff; }
+  .faq-item[open] .faq-q .ico::after { opacity: 0; }
+  .faq-a { padding: 0 44px 22px 2px; }
+  .faq-a p { font-size: 13.5px; line-height: 1.85; }
+  .faq-a code {
+    font-family: var(--mono); font-size: .92em; background: var(--bg-soft);
+    padding: 1px 5px; border-radius: 4px; color: var(--ink-soft);
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary { list-style: none; }
+
+  /* ============================================================
+     14. CTA
+     ============================================================ */
+  .cta-band { padding: 0 0 108px; }
+  .cta-inner {
+    position: relative; overflow: hidden; border-radius: var(--r-2xl);
+    padding: 64px 56px;
+    background: linear-gradient(120deg, #171A34 0%, #241B4D 46%, #0B3B4A 100%);
+    box-shadow: 0 50px 90px -50px rgba(23, 26, 52, .9);
+  }
+  .cta-inner::before {
+    content: ""; position: absolute; inset: -40% -10% auto auto; width: 620px; height: 620px;
+    background: radial-gradient(circle, rgba(124, 58, 237, .55), transparent 62%);
+    filter: blur(20px);
+  }
+  .cta-inner::after {
+    content: ""; position: absolute; inset: auto auto -50% -12%; width: 560px; height: 560px;
+    background: radial-gradient(circle, rgba(6, 182, 212, .35), transparent 62%);
+    filter: blur(20px);
+  }
+  .cta-content { position: relative; z-index: 1; max-width: 560px; }
+  .cta-content .eyebrow { color: #A5B4FC; }
+  .cta-content h2 { font-size: clamp(1.9rem, 3.4vw, 2.6rem); color: #fff; margin-bottom: 14px; }
+  .cta-content p { font-size: 1rem; line-height: 1.8; color: #B9C2D6; margin-bottom: 30px; }
+  .cta-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+  .cta-meta { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 24px; font-size: 12.5px; color: #8894AB; }
+  .cta-meta span { display: inline-flex; align-items: center; gap: 6px; }
+  .cta-meta svg { width: 13px; height: 13px; color: #7DE2B8; }
+
+  /* ============================================================
+     15. Footer
+     ============================================================ */
+  .footer { background: #0A0E16; color: #8C97AB; padding: 72px 0 0; }
+  .footer-top { display: grid; grid-template-columns: 1.6fr repeat(4, 1fr); gap: 40px; padding-bottom: 56px; }
+  .footer-brand .logo-text { color: #fff; }
+  .footer-brand .logo-text em { color: #5D6B82; border-left-color: #2A3040; }
+  .footer-brand p { font-size: 13px; line-height: 1.8; color: #8C97AB; margin: 18px 0 20px; max-width: 280px; }
+  .footer-status {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 5px 11px; border-radius: var(--r-full);
+    background: rgba(14, 159, 110, .1); border: 1px solid rgba(14, 159, 110, .26);
+    font-size: 11.5px; font-weight: 600; color: #7DE2B8;
+  }
+  .footer-status i { width: 6px; height: 6px; border-radius: 50%; background: #34D399; box-shadow: 0 0 0 3px rgba(52, 211, 153, .16); }
+  .footer-col h4 {
+    font-size: 11px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;
+    color: #fff; margin-bottom: 16px;
+  }
+  .footer-col ul { display: grid; gap: 11px; }
+  .footer-col a { font-size: 13px; color: #8C97AB; transition: color .16s; }
+  .footer-col a:hover { color: #fff; }
+  .footer-col .new {
+    font-size: 9px; font-weight: 800; letter-spacing: .05em; color: #A5B4FC;
+    background: rgba(129, 140, 248, .14); padding: 1px 5px; border-radius: 3px; margin-left: 5px;
+    vertical-align: 1px;
+  }
+  .footer-bottom {
+    border-top: 1px solid rgba(255, 255, 255, .08);
+    padding: 22px 0 26px; display: flex; justify-content: space-between;
+    align-items: center; gap: 16px; flex-wrap: wrap;
+    font-size: 12px; color: #64708A;
+  }
+  .footer-bottom-links { display: flex; gap: 20px; flex-wrap: wrap; }
+  .footer-bottom a:hover { color: #C3CBD9; }
+
+  /* 复制提示 */
+  .toast {
+    position: fixed; left: 50%; bottom: 34px; z-index: 200;
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 16px; border-radius: var(--r-full);
+    background: #0B0F18; color: #fff; font-size: 13px; font-weight: 600;
+    box-shadow: 0 20px 40px -16px rgba(0, 0, 0, .6);
+    opacity: 0; transform: translate(-50%, 12px); pointer-events: none;
+    transition: opacity .25s var(--ease), transform .25s var(--ease);
+  }
+  .toast.is-on { opacity: 1; transform: translate(-50%, 0); }
+  .toast svg { width: 14px; height: 14px; color: #7DE2B8; }
+
+  /* ============================================================
+     16. Responsive
+     ============================================================ */
+  @media (max-width: 1080px) {
+    .hero-inner { gap: 40px; }
+    .float-a { left: -10px; }
+    .float-b { right: -6px; }
+    .api-wrap { gap: 40px; }
+    .faq-wrap { gap: 40px; }
+    .footer-top { grid-template-columns: 1.4fr repeat(2, 1fr); row-gap: 36px; }
+  }
+  @media (max-width: 960px) {
+    .section { padding: 84px 0; }
+    .nav-links { display: none; }
+    .nav-login { display: none; }
+    .nav-toggle { display: grid; }
+    .nav-actions .btn--primary { display: none; }
+    .hero { padding: 60px 0 72px; }
+    .hero-inner { grid-template-columns: 1fr; gap: 52px; }
+    .hero-sub { max-width: 100%; }
+    .hero-visual { max-width: 520px; margin: 0 auto; width: 100%; }
+    .bento { grid-template-columns: repeat(4, 1fr); }
+    .bcard--4 { grid-column: span 4; }
+    .bcard--3 { grid-column: span 2; }
+    .bcard { grid-column: span 2; }
+    .steps { grid-template-columns: 1fr; }
+    .step::after { display: none; }
+    .api-wrap { grid-template-columns: 1fr; gap: 36px; }
+    .faq-wrap { grid-template-columns: 1fr; gap: 28px; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .stat:nth-child(3) { border-left: none; }
+    .stat:nth-child(1), .stat:nth-child(2) { border-bottom: 1px solid var(--line); }
+    .price-grid { grid-template-columns: 1fr; max-width: 480px; margin: 0 auto; }
+    .cta-inner { padding: 48px 32px; }
+    .footer-top { grid-template-columns: 1fr 1fr; }
+    .footer-brand { grid-column: span 2; }
+  }
+  @media (max-width: 640px) {
+    .section { padding: 68px 0; }
+    .container { padding: 0 18px; }
+    .sec-head { margin-bottom: 40px; }
+    .announce-inner { font-size: 12px; gap: 7px; padding: 8px 16px; }
+    .hero h1 { font-size: clamp(2rem, 8.6vw, 2.6rem); }
+    .hero-sub { font-size: 15px; }
+    .hero-cta .btn { flex: 1 1 100%; }
+    .float-a { top: -14px; left: 0; }
+    .float-b { bottom: -16px; right: 0; }
+    .console-url { display: none; }
+    .dropzone { padding: 22px 14px; }
+    .bento { grid-template-columns: 1fr; }
+    .bcard, .bcard--4, .bcard--3 { grid-column: span 1; }
+    .stats-grid { grid-template-columns: 1fr; }
+    .stat { border-left: none !important; border-bottom: 1px solid var(--line); }
+    .stat:last-child { border-bottom: none; }
+    .plan { padding: 26px 22px; }
+    .cta-inner { padding: 40px 24px; border-radius: var(--r-xl); }
+    .cta-band { padding-bottom: 72px; }
+    .footer { padding-top: 56px; }
+    .footer-top { grid-template-columns: 1fr; gap: 32px; }
+    .footer-brand { grid-column: span 1; }
+    .footer-bottom { flex-direction: column; align-items: flex-start; }
+    .faq-a { padding-right: 12px; }
+    .shot { width: 190px; height: 128px; }
+    .code-panel { padding: 16px 14px 18px; }
+    .code-panel pre { font-size: 11px; }
+    .hero-visual::before { opacity: .4; }
+  }
+
+  /* 减少动效 */
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after {
+      animation-duration: .001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important;
     }
-    [data-theme="dark"] body{
-      background:
-        radial-gradient(circle at top left, rgba(155,125,255,0.18), transparent 28%),
-        radial-gradient(circle at top right, rgba(123,211,252,0.14), transparent 24%),
-        radial-gradient(circle at bottom, rgba(255,127,168,0.1), transparent 30%),
-        var(--bg);
-    }
-    [data-theme="dark"] .sidebar{background:rgba(30,26,46,0.62);border-color:rgba(123,140,255,0.14)}
-    [data-theme="dark"] .soft-card,
-    [data-theme="dark"] .tag-cluster span,
-    [data-theme="dark"] .hero-badge,
-    [data-theme="dark"] .queue-item,
-    [data-theme="dark"] .timeline-item,
-    [data-theme="dark"] .feature-list li,
-    [data-theme="dark"] .mini-stats div,
-    [data-theme="dark"] .insight-footer div,
-    [data-theme="dark"] .profile-stats div,
-    [data-theme="dark"] .security-item,
-    [data-theme="dark"] .toggle-item,
-    [data-theme="dark"] .record-item,
-    [data-theme="dark"] .gallery-card{background:rgba(30,26,46,0.72);border-color:rgba(123,140,255,0.14)}
-    [data-theme="dark"] .ghost-btn{background:rgba(40,35,60,0.8);color:var(--text)}
-    [data-theme="dark"] .field input,
-    [data-theme="dark"] .field textarea,
-    [data-theme="dark"] .field select{background-color:rgba(30,26,46,0.78);color:var(--text)}
-    [data-theme="dark"] .field input:focus,
-    [data-theme="dark"] .field textarea:focus,
-    [data-theme="dark"] .field select:focus{background-color:#1e1a2e}
-    [data-theme="dark"] .code-card pre{background:#0a0c1a}
-
-    /* ============ 集成样式（JS 生成的组件 + 系统 ID 适配） ============ */
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif}
-
-    /* 移动端侧边栏 */
-    .menu-toggle{display:none;position:fixed;top:16px;left:16px;z-index:200;width:44px;height:44px;border-radius:14px;border:0;background:var(--panel-strong);box-shadow:var(--shadow);cursor:pointer;font-size:20px;color:var(--text)}
-    .sidebar-overlay{display:none;position:fixed;inset:0;z-index:150;background:rgba(0,0,0,0.4);backdrop-filter:blur(2px)}
-    .sidebar-overlay.show{display:block}
-    @media(max-width:1280px){
-      .menu-toggle{display:flex;align-items:center;justify-content:center}
-      .sidebar{position:fixed;left:0;top:0;bottom:0;z-index:180;transform:translateX(-100%);transition:transform .3s ease;height:100vh}
-      .sidebar.open{transform:translateX(0)}
-    }
-
-    /* Toast 通知 */
-    .notif-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px;pointer-events:none}
-    .notif{display:flex;align-items:center;gap:10px;padding:14px 18px;border-radius:16px;background:var(--panel-strong);backdrop-filter:blur(18px);box-shadow:var(--shadow);border:1px solid var(--line);font-size:0.92rem;color:var(--text);min-width:240px;max-width:400px;animation:notif-in .3s ease;pointer-events:auto}
-    .notif i{font-size:20px;flex-shrink:0}
-    .notif.success{border-color:rgba(82,216,162,0.4)}.notif.success i{color:#22a36d}
-    .notif.error{border-color:rgba(255,127,168,0.4)}.notif.error i{color:#e53e6b}
-    .notif.warning{border-color:rgba(255,193,87,0.4)}.notif.warning i{color:#d9a441}
-    .notif.info{border-color:rgba(123,140,255,0.4)}.notif.info i{color:#7b8cff}
-    .notif.notif-out{animation:notif-out .3s ease forwards}
-    @keyframes notif-in{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
-    @keyframes notif-out{to{opacity:0;transform:translateX(40px)}}
-
-    /* 确认弹窗 */
-    .modal-overlay{display:none;position:fixed;inset:0;z-index:5000;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px);align-items:center;justify-content:center}
-    .modal-overlay.show{display:flex}
-    .modal-box{background:var(--panel-strong);backdrop-filter:blur(24px);border-radius:24px;box-shadow:var(--shadow);border:1px solid var(--line);padding:28px;max-width:420px;width:90%;animation:modal-in .3s var(--ease-out)}
-    @keyframes modal-in{from{opacity:0;transform:scale(0.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
-    .modal-title{margin:0 0 12px;font-size:1.2rem;font-weight:700}
-    .modal-body{margin:0 0 24px;color:var(--muted);line-height:1.6}
-    .modal-actions{display:flex;gap:12px;justify-content:flex-end}
-    .modal-btn{padding:12px 20px;border-radius:14px;border:0;cursor:pointer;font:inherit;font-weight:600;transition:transform .2s ease,background .2s ease}
-    .modal-btn:hover{transform:translateY(-1px)}
-    .modal-btn.cancel{background:rgba(128,139,194,0.12);color:var(--muted)}
-    .modal-btn.confirm{background:var(--gradient-main);color:#fff;box-shadow:0 8px 20px rgba(133,102,255,0.22)}
-
-    /* API 选择器 */
-    .api-select-wrap{display:flex;align-items:center;gap:12px}
-    .api-select{padding:12px 40px 12px 16px;border-radius:14px;background:rgba(255,255,255,0.8);border:1px solid rgba(128,139,194,0.16);color:var(--text);font:inherit;font-size:0.92rem;font-weight:600;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='%236a7191' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 16px center;min-width:180px}
-    [data-theme="dark"] .api-select{background-color:rgba(30,26,46,0.8)}
-    .max-size-hint{font-size:0.82rem;color:var(--muted);font-weight:600}
-
-    /* 上传区适配 */
-    .upload-card{padding:28px}
-    .upload-zone{padding:32px;border:2px dashed rgba(136,142,212,0.28);border-radius:26px;background:linear-gradient(135deg,rgba(123,140,255,0.06),rgba(255,122,198,0.04));text-align:center;cursor:pointer;transition:border .25s ease,background .25s ease}
-    .upload-zone.dragover{border-color:var(--primary);background:linear-gradient(135deg,rgba(123,140,255,0.14),rgba(255,122,198,0.1))}
-    .upload-zone .dropzone-icon{width:60px;height:60px;border-radius:20px;background:var(--gradient-main);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;color:#fff;font-size:28px}
-    .upload-zone h4{margin:0 0 8px;font-size:1.15rem}
-    .upload-zone p{margin:0 0 16px}
-    .upload-zone .browse-btn{margin:0 auto}
-    .file-names{margin-top:12px;font-size:0.84rem;color:var(--muted);text-align:left}
-    .file-names div{padding:4px 0}
-
-    /* 文件队列 */
-    .queue-list{margin-top:20px}
-    .queue-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-    .queue-header b{color:var(--primary)}
-    .queue-item{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:16px;background:rgba(255,255,255,0.75);border:1px solid rgba(128,139,194,0.12);margin-bottom:10px}
-    [data-theme="dark"] .queue-item{background:rgba(30,26,46,0.72)}
-    .queue-item .file-icon{font-size:24px;color:var(--primary)}
-    .queue-item .queue-info{flex:1;min-width:0}
-    .queue-item .name{font-weight:600;font-size:0.92rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .queue-item .meta{font-size:0.82rem;color:var(--muted);margin-top:2px}
-    .queue-cancel{width:32px;height:32px;border-radius:10px;border:0;background:rgba(255,127,168,0.12);color:#e53e6b;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .2s ease}
-    .queue-cancel:hover{background:rgba(255,127,168,0.22)}
-
-    /* 上传操作 */
-    .upload-actions{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap;justify-content:center}
-    .upload-actions .primary-btn{display:inline-flex;align-items:center;gap:8px}
-    .upload-actions .primary-btn:disabled{opacity:0.5;cursor:not-allowed;box-shadow:none}
-    .upload-actions .ghost-btn{display:inline-flex;align-items:center;gap:8px}
-
-    /* 进度条 */
-    .progress-wrap{margin-top:20px;padding:18px;border-radius:18px;background:rgba(123,140,255,0.06)}
-    .progress-title{font-weight:700;margin-bottom:12px;font-size:0.92rem}
-    .progress-bar-wrap{height:12px;background:rgba(123,140,255,0.12);border-radius:999px;overflow:hidden}
-    .progress-bar{display:block;height:100%;background:var(--gradient-main);border-radius:inherit;transition:width .4s ease}
-    .progress-detail{margin-top:8px;font-size:0.82rem;color:var(--muted)}
-
-    /* 结果区 */
-    .result-wrap{margin-top:20px}
-    .result-success{padding:18px;border-radius:18px;background:rgba(82,216,162,0.08);border:1px solid rgba(82,216,162,0.2)}
-    .result-link{display:flex;gap:10px;align-items:center}
-    .result-link input{flex:1;padding:12px 16px;border-radius:14px;border:1px solid var(--line);background:rgba(255,255,255,0.8);font-family:"SF Mono",Consolas,Monaco,Menlo,"Courier New",monospace;font-size:0.88rem;color:var(--text)}
-    [data-theme="dark"] .result-link input{background:rgba(30,26,46,0.8)}
-    .result-error{padding:18px;border-radius:18px;background:rgba(255,127,168,0.08);border:1px solid rgba(255,127,168,0.2);color:#e53e6b}
-
-    /* 历史记录 */
-    .history-item{display:flex;align-items:center;gap:14px;padding:14px;border-radius:18px;background:rgba(255,255,255,0.75);border:1px solid rgba(128,139,194,0.12);transition:transform .2s ease,box-shadow .2s ease}
-    [data-theme="dark"] .history-item{background:rgba(30,26,46,0.72)}
-    .history-item:hover{transform:translateY(-2px);box-shadow:0 16px 30px rgba(126,129,188,0.12)}
-    .history-thumb{width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,rgba(123,140,255,0.2),rgba(255,122,198,0.16));display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--primary);flex-shrink:0;overflow:hidden}
-    .history-thumb img{width:100%;height:100%;object-fit:cover}
-    .history-info{flex:1;min-width:0}
-    .history-info .name{font-weight:600;font-size:0.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .history-info .meta{font-size:0.8rem;color:var(--muted);margin-top:2px}
-    .history-link{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:var(--muted);text-decoration:none;flex-shrink:0;transition:background .2s ease,color .2s ease}
-    .history-link:hover{background:rgba(123,140,255,0.1);color:var(--primary)}
-    .history-empty{text-align:center;padding:40px 20px;color:var(--muted);font-size:0.92rem}
-
-    /* 图表工具提示 */
-    .chart-tooltip{position:absolute;background:var(--panel-strong);backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:12px;padding:8px 12px;font-size:0.82rem;pointer-events:none;z-index:10;box-shadow:var(--shadow);display:none}
-    .chart-tooltip.show{display:block}
-    #trendChart{position:relative}
-    .trend-dot:hover{r:5}
-    /* 趋势图汇总 4 列 */
-    .insight-footer{grid-template-columns:repeat(4,1fr)}
-    @media(max-width:768px){.insight-footer{grid-template-columns:repeat(2,1fr)}}
-
-    /* 存储卡 */
-    .storage-value{font-size:2rem;font-weight:800;background:var(--gradient-main);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-
-    /* 横幅 */
-    .admin-preview-banner{display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:16px;background:linear-gradient(90deg,rgba(123,140,255,0.12),rgba(155,125,255,0.12));border:1px solid rgba(123,140,255,0.2);color:#7160ff;font-size:0.88rem;line-height:1.5;margin-bottom:18px}
-    [data-theme="dark"] .admin-preview-banner{color:#a5a0ff}
-    .admin-preview-banner i{font-size:18px;flex-shrink:0;color:var(--primary)}
-    .admin-preview-banner a{color:inherit;text-decoration:underline;font-weight:600}
-    .site-warning-banner{display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:16px;background:linear-gradient(90deg,rgba(255,127,168,0.12),rgba(255,193,87,0.08));border:1px solid rgba(255,127,168,0.2);color:#e53e6b;font-size:0.88rem;margin-bottom:18px}
-    .guest-banner{display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:16px;background:linear-gradient(90deg,rgba(123,140,255,0.08),rgba(125,211,252,0.06));border:1px solid rgba(123,140,255,0.12);color:var(--muted);font-size:0.88rem;margin-bottom:18px}
-    .guest-banner a{color:var(--primary);text-decoration:none;font-weight:600}
-
-    /* 站点通知弹窗 */
-    .notice-modal-overlay{display:none;position:fixed;inset:0;z-index:5000;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px);align-items:center;justify-content:center}
-    .notice-modal-overlay.show{display:flex}
-    .notice-modal{background:var(--panel-strong);backdrop-filter:blur(24px);border-radius:24px;box-shadow:var(--shadow);border:1px solid var(--line);padding:32px;max-width:480px;width:90%}
-    .notice-modal-head{font-size:1.3rem;font-weight:800;margin-bottom:16px}
-    .notice-modal-body{color:var(--muted);line-height:1.7;white-space:pre-wrap;max-height:50vh;overflow-y:auto}
-    .notice-modal-foot{margin-top:24px;text-align:right}
-    .notice-modal-btn{padding:12px 24px;border-radius:14px;border:0;background:var(--gradient-main);color:#fff;font-weight:600;cursor:pointer}
-
-    /* 时钟（topbar 内） */
-    #clockDisplay{font-size:0.82rem;color:var(--muted);font-family:"SF Mono",Consolas,Monaco,Menlo,"Courier New",monospace;white-space:nowrap;display:flex;align-items:center}
-
-    /* 主题切换按钮 */
-    #themeToggle{width:40px;height:40px;border-radius:12px;border:0;background:rgba(255,255,255,0.7);color:var(--text);cursor:pointer;font-size:20px;display:flex;align-items:center;justify-content:center;transition:background .2s ease;flex-shrink:0}
-    [data-theme="dark"] #themeToggle{background:rgba(30,26,46,0.7)}
-    #themeToggle:hover{background:rgba(123,140,255,0.12)}
-
-    /* 隐藏元素（JS 需要但不需要显示） */
-    .hidden-ref{display:none}
-  </style>
+    .reveal { opacity: 1; transform: none; }
+    .marquee-track, .flow-track { animation: none; }
+  }
+</style>
 </head>
 <body>
-  <button class="menu-toggle" id="menuToggle"><i class="mdi mdi-menu"></i></button>
-  <div class="sidebar-overlay" id="sidebarOverlay"></div>
 
-  <div class="page-shell">
-    <aside class="sidebar" id="sidebar">
-      <div class="brand">
-        <div class="brand-mark"><span></span><span></span><span></span></div>
-        <div>
-          <strong><?php echo htmlspecialchars($siteName);?></strong>
-          <p>图床控制台</p>
-        </div>
-      </div>
+<!-- ============ 公告条 ============ -->
+<div class="announce">
+  <div class="announce-inner">
+    <span class="pill-new">NEW</span>
+    <span>已内置 <?php echo (int)$apiCount;?> 个图床接口，支持本地上传与自定义 S3 存储</span>
+    <a href="#features">查看功能
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+    </a>
+  </div>
+</div>
 
-      <nav class="side-nav">
-        <a class="active" href="#upload"><i class="mdi mdi-upload"></i> 上传图片</a>
-        <a href="#history"><i class="mdi mdi-history"></i> 上传历史</a>
-        <?php if($isUserLoggedIn): ?>
-        <a href="user/"><i class="mdi mdi-account-circle"></i> 个人中心</a>
-        <?php endif; ?>
-      </nav>
+<!-- ============ 导航 ============ -->
+<header class="nav" id="nav">
+  <div class="nav-inner">
+    <a href="./" class="logo" aria-label="<?php echo htmlspecialchars($siteName, ENT_QUOTES, 'UTF-8');?> 首页">
+      <span class="logo-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 15.5l8-10 8 10"/><circle cx="12" cy="18" r="2.1" fill="#fff" stroke="none"/>
+        </svg>
+      </span>
+      <span class="logo-text"><?php echo htmlspecialchars($siteName, ENT_QUOTES, 'UTF-8');?><em>聚合图床</em></span>
+    </a>
 
-      <?php if($isUserLoggedIn): ?>
-      <div class="storage-card soft-card">
-        <div class="section-caption">存储</div>
-        <div class="storage-value" id="storageTag">--</div>
-        <div class="meter"><span id="storageFill" style="width:0%"></span></div>
-        <p>已使用 <span id="storageUsed">0</span> / <span id="storageTotal">0</span></p>
-      </div>
+    <nav class="nav-links" aria-label="主导航">
+      <a href="#features">产品功能</a>
+      <a href="#providers">图床接口</a>
+      <a href="#api">开发接入</a>
+      <a href="#pricing">套餐配额</a>
+      <a href="#faq">常见问题</a>
+    </nav>
+
+    <div class="nav-actions">
+      <?php if($isUser): ?>
+      <a href="<?php echo $userCenterUrl;?>" class="btn btn--primary">进入个人中心
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+      <?php elseif($isAdmin): ?>
+      <a href="<?php echo $loginUrl;?>" class="nav-login">用户登录</a>
+      <?php else: ?>
+      <a href="<?php echo $loginUrl;?>" class="nav-login">登录</a>
+      <a href="<?php echo $regEnabled ? $registerUrl : $loginUrl;?>" class="btn btn--primary"><?php echo $regEnabled ? '免费注册' : '登录使用';?>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
       <?php endif; ?>
+      <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="navMobile" aria-label="展开菜单">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </div>
 
-      <div class="tag-cluster">
-        <span>CDN</span>
-        <span>水印</span>
-        <span>防盗链</span>
-        <span>WebP</span>
+  <div class="nav-mobile" id="navMobile">
+    <a href="#features">产品功能</a>
+    <a href="#providers">图床接口</a>
+    <a href="#api">开发接入</a>
+    <a href="#pricing">套餐配额</a>
+    <a href="#faq">常见问题</a>
+    <?php if($isUser): ?>
+    <a href="<?php echo $userCenterUrl;?>">个人中心</a>
+    <?php elseif($isAdmin): ?>
+    <a href="<?php echo $loginUrl;?>">用户登录</a>
+    <?php else: ?>
+    <a href="<?php echo $loginUrl;?>">登录</a>
+    <?php endif; ?>
+    <a href="<?php echo $primaryCtaUrl;?>" class="btn btn--primary"><?php echo htmlspecialchars($primaryCtaText, ENT_QUOTES, 'UTF-8');?></a>
+  </div>
+</header>
+
+<main>
+
+<!-- ============ Hero ============ -->
+<section class="hero">
+  <div class="container hero-inner">
+    <div class="hero-text">
+      <div class="hero-badge">
+        <span class="tag">v<?php echo htmlspecialchars(APP_VERSION, ENT_QUOTES, 'UTF-8');?></span>
+        多图床聚合上传已上线
       </div>
 
-      <?php if(!empty($siteEmail)): ?>
-      <div class="contact-card soft-card">
-        <div class="section-caption">联系我们</div>
-        <div class="contact-email" onclick="copyContactEmail('<?php echo htmlspecialchars($siteEmail, ENT_QUOTES); ?>')">
-          <i class="mdi mdi-email-outline"></i>
-          <span><?php echo htmlspecialchars($siteEmail); ?></span>
-          <i class="mdi mdi-content-copy contact-copy-icon"></i>
-        </div>
+      <h1>一个地址<br><span class="grad-text">聚合所有图床</span></h1>
+
+      <p class="hero-sub">
+        把 <?php echo (int)$apiCount;?> 个内置图床接口（含本地上传）与自定义 S3 存储，
+        收进一个账号、一个上传入口。网页上传、用户中心与 API 密钥上传都使用同一套套餐与图片记录。
+      </p>
+
+      <div class="hero-cta">
+        <a href="<?php echo $primaryCtaUrl;?>" class="btn btn--primary btn--lg"><?php echo htmlspecialchars($primaryCtaText, ENT_QUOTES, 'UTF-8');?>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
+        <a href="<?php echo $apiDocUrl;?>" class="btn btn--ghost btn--lg">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l-6-6 6-6M15 6l6 6-6 6"/></svg>
+          查看 API 文档
+        </a>
       </div>
-      <?php endif; ?>
-    </aside>
 
-    <main class="main-content">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">IMAGE HOSTING</p>
-          <h1><?php echo htmlspecialchars($siteName);?></h1>
-        </div>
-        <div class="topbar-actions">
-          <div id="clockDisplay"><span></span></div>
-          <button id="themeToggle" type="button" title="切换主题"><i class="mdi mdi-weather-night"></i></button>
-          <?php if(!$isUserLoggedIn): ?>
-          <a class="ghost-btn" href="api_doc.php"><i class="mdi mdi-file-document-outline"></i> API 文档</a>
-          <a class="ghost-btn" href="user/login.php"><i class="mdi mdi-login"></i> 登录</a>
-          <a class="primary-btn" href="user/register.php"><i class="mdi mdi-account-plus"></i> 注册</a>
-          <?php else: ?>
-          <a class="ghost-btn" href="api_doc.php"><i class="mdi mdi-file-document-outline"></i> API 文档</a>
-          <a class="ghost-btn" href="user/"><i class="mdi mdi-account-circle"></i> 个人中心</a>
-          <?php endif; ?>
-        </div>
-      </header>
-
-      <?php if($isAdminPreviewGuest): ?>
-      <div class="admin-preview-banner">
-        <i class="mdi mdi-eye-outline"></i>
-        <span><strong>访客预览模式</strong>：已检测到管理员后台登录，前端正以访客身份呈现，便于验证访问控制配置。
-          <a href="admin/">返回后台</a>
-        </span>
+      <div class="hero-note">
+        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><?php echo (int)$apiCount;?> 个内置接口</span>
+        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>默认套餐 <?php echo htmlspecialchars($defaultStorageText, ENT_QUOTES, 'UTF-8');?></span>
+        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>API 密钥接入</span>
       </div>
-      <?php endif; ?>
+    </div>
 
-      <?php if(!empty($siteWarning)): ?>
-      <div class="site-warning-banner">
-        <i class="mdi mdi-alert-circle-outline"></i>
-        <span><?php echo htmlspecialchars($siteWarning);?></span>
+    <!-- 上传控制台示意 -->
+    <div class="hero-visual">
+      <div class="float-card float-a">
+        <span class="live"></span> 已内置 <?php echo (int)$apiCount;?> 个接口
       </div>
-      <?php endif; ?>
-
-      <?php if(!$isUserLoggedIn && empty($isAdminPreviewGuest)): ?>
-      <div class="guest-banner">
-        <i class="mdi mdi-information-outline"></i>
-        <span>当前为访客模式，<a href="user/login.php">登录</a> 后可管理图片和使用更多功能</span>
+      <div class="float-card float-b">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z"/></svg>
+        密钥 / 会话隔离
       </div>
-      <?php endif; ?>
 
-      <!-- 上传区 -->
-      <section class="upload-card soft-card" id="upload">
-        <div class="section-heading">
-          <div>
-            <p class="section-caption">Upload Center</p>
-            <h3>上传图片</h3>
-          </div>
-          <div class="api-select-wrap">
-            <select class="api-select" id="apiSelect">
-              <?php
-              $apiIdx = 0;
-              foreach($apiConfig as $key => $cfg):
-                $enableKey = 'api_'.$key.'_enable';
-                $aliasKey  = 'api_'.$key.'_alias';
-                $maxKey    = 'api_'.$key.'_maxsize';
-                $enabled = isset($conf[$enableKey]) && $conf[$enableKey] == '1';
-                if($enabled):
-                  if($forceHideLocal && $key === 'local') { $apiIdx++; continue; }
-                  if($hasApiRestriction && !in_array($key, $allowedApiInfo['api_keys'])) { $apiIdx++; continue; }
-                  $alias = isset($conf[$aliasKey]) && $conf[$aliasKey] !== '' ? $conf[$aliasKey] : $cfg['name'];
-                  $maxSize = isset($conf[$maxKey]) && $conf[$maxKey] > 0 ? (float)$conf[$maxKey] : (float)$cfg['max_size'];
-                  $sel = ($key === $defaultApi) ? ' selected' : '';
-              ?>
-              <option value="<?php echo htmlspecialchars((string)$key);?>" data-maxsize="<?php echo $maxSize;?>" data-type="api"<?php echo $sel;?>><?php echo htmlspecialchars($alias);?></option>
-              <?php
-                  $apiIdx++;
-                endif;
-              endforeach;
-              // S3 接口
-              if(!$hasApiRestriction || !empty($allowedApiInfo['s3_ids'])):
-                foreach($s3Configs as $i => $s3):
-                  if($hasApiRestriction && !in_array($i, $allowedApiInfo['s3_ids'])) continue;
-                  $s3Name = isset($s3['name']) ? $s3['name'] : ('S3-'.$i);
-                  $s3Max = isset($s3['max_size']) ? (float)$s3['max_size'] : 10;
-                  $sel = ('s3_'.$i === $defaultApi) ? ' selected' : '';
-              ?>
-              <option value="s3_<?php echo $i;?>" data-maxsize="<?php echo $s3Max;?>" data-type="s3" data-s3id="<?php echo $i;?>"<?php echo $sel;?>><?php echo htmlspecialchars($s3Name);?></option>
-              <?php
-                endforeach;
-              endif;
-              ?>
-            </select>
-            <span class="max-size-hint">当前：<span id="selectedHostName">-</span> · 最大 <span id="maxSizeDisplay">10 MB</span></span>
+      <div class="console" aria-hidden="true">
+        <div class="console-head">
+          <div class="dots"><i></i><i></i><i></i></div>
+          <div class="console-url"><?php echo htmlspecialchars(parse_url($apiBase, PHP_URL_HOST) ?: 'localhost', ENT_QUOTES, 'UTF-8');?>/user/</div>
+          <div class="console-secure">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+            SSL
           </div>
         </div>
 
-        <div class="upload-zone" id="dropZone">
-          <div class="dropzone-icon" id="dropZoneIcon"><i class="mdi mdi-cloud-upload-outline"></i></div>
-          <h4 id="dropZoneTitle">点击选择或拖拽图片到此处</h4>
-          <p id="dropZoneSubtitle">支持 JPG / PNG / GIF / WEBP，单文件最大 <span id="detailMaxSize">10 MB</span></p>
-          <div class="file-names" id="dropZoneFileNames" style="display:none;"></div>
-          <button class="primary-btn" id="browseBtn" type="button"><i class="mdi mdi-folder-open-outline"></i> 浏览文件</button>
-          <input type="file" id="fileInput" multiple accept="image/*" style="display:none;">
-          <p id="fileHint"></p>
-        </div>
-
-        <div class="queue-list" id="fileListWrap" style="display:none;">
-          <div class="queue-header">
-            <span>已选择 <b id="fileCountEl">0</b> 个文件</span>
-            <button class="ghost-btn small" id="clearFilesBtn" type="button"><i class="mdi mdi-delete-outline"></i> 清空</button>
+        <div class="dropzone">
+          <div class="dz-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
           </div>
-          <div id="fileListEl"></div>
+          <p class="dz-title">拖拽图片到这里</p>
+          <p class="dz-sub">或 <kbd>Ctrl</kbd> + <kbd>V</kbd> 粘贴 · JPG / PNG / GIF / WebP</p>
         </div>
 
-        <div class="upload-actions">
-          <?php if($needLoginToUpload): ?>
-          <button class="primary-btn" id="uploadBtn" type="button" data-need-login="1">
-            <i class="mdi mdi-login" id="btnIcon"></i>
-            <span id="btnLabel">登录后开始上传</span>
-          </button>
-          <?php else: ?>
-          <button class="primary-btn" id="uploadBtn" type="button" disabled>
-            <i class="mdi mdi-upload" id="btnIcon"></i>
-            <span id="btnLabel">开始上传</span>
-            (<span id="uploadCountEl">0</span>)
-          </button>
-          <button class="ghost-btn" id="clearAllBtn" type="button"><i class="mdi mdi-close"></i> 清空全部</button>
-          <?php endif; ?>
-        </div>
-
-        <div class="progress-wrap" id="progressWrap" style="display:none;">
-          <div class="progress-title" id="progressTitle">上传中...</div>
-          <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
-          <div class="progress-detail" id="progressDetail"></div>
-        </div>
-
-        <div class="result-wrap" id="resultWrap" style="display:none;">
-          <div class="result-success" id="successBox">
-            <div class="result-link">
-              <input type="text" id="resultLinkText" readonly>
-              <button class="ghost-btn small" id="copyBtn" type="button"><i class="mdi mdi-content-copy"></i> 复制</button>
+        <div class="filelist">
+          <div class="file">
+            <div class="file-thumb g1"></div>
+            <div>
+              <div class="file-name">mountain-sunrise.jpg</div>
+              <div class="bar"><span style="--w:100%; animation-delay:.1s"></span></div>
+            </div>
+            <div class="file-state">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+              已上传
             </div>
           </div>
-          <div class="result-error" id="errorBox" style="display:none;">
-            <p id="errorMsg"></p>
+
+          <div class="file">
+            <div class="file-thumb g3"></div>
+            <div>
+              <div class="file-name">studio-portrait.png</div>
+              <div class="bar"><span style="--w:100%; animation-delay:.28s"></span></div>
+            </div>
+            <div class="file-state">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+              已上传
+            </div>
+          </div>
+
+          <div class="file">
+            <div class="file-thumb g6"></div>
+            <div>
+              <div class="file-name">product-shot-04.webp</div>
+              <div class="bar"><span style="--w:68%; animation-delay:.46s"></span></div>
+            </div>
+            <div class="file-state is-syncing">
+              <span class="spin"></span>
+              调度中
+            </div>
           </div>
         </div>
 
-        <p class="status-text" id="statusText" style="margin-top:12px;font-size:0.84rem;color:var(--muted);"></p>
-      </section>
-
-      <!-- 统计卡片 -->
-      <section class="stats-grid">
-        <article class="stat-card soft-card">
-          <div class="stat-top"><span class="stat-chip blue">图床数量</span><strong id="hostCount">0</strong></div>
-          <p>当前可用的图床接口数</p>
-        </article>
-        <article class="stat-card soft-card">
-          <div class="stat-top"><span class="stat-chip green">总上传</span><strong id="totalUploads">0</strong></div>
-          <p>全站累计上传图片数</p>
-        </article>
-        <article class="stat-card soft-card">
-          <div class="stat-top"><span class="stat-chip rose">今日上传</span><strong id="todayUploads">0</strong></div>
-          <p>今日全站上传图片数</p>
-        </article>
-        <article class="stat-card soft-card">
-          <div class="stat-top"><span class="stat-chip violet">成功率</span><strong id="successRate">--</strong></div>
-          <p>最近上传成功率</p>
-        </article>
-      </section>
-
-      <!-- 访问趋势 -->
-      <article class="insight-card soft-card">
-        <div class="section-heading">
-          <div>
-            <p class="section-caption">Traffic Insight</p>
-            <h3>访问趋势</h3>
-          </div>
-          <span class="tiny-switch">最近 7 天</span>
+        <div class="console-foot">
+          <span class="chip">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 4v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V7l7-4z"/></svg>
+            目标接口 · 按套餐可用
+          </span>
+          <span class="chip chip--ok">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+            3 / 3 完成
+          </span>
         </div>
-        <div class="insight-footer">
-          <div><strong id="trendTotal">0</strong><span>本周上传</span></div>
-          <div><strong id="trendPeak">0</strong><span>峰值</span></div>
-          <div><strong id="trendAvg">0</strong><span>日均</span></div>
-          <div><strong id="trendMin">0</strong><span>最低</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 存储源 ============ -->
+<section class="providers" id="providers">
+  <?php
+  // 展示系统实际内置接口中的代表性名称 + 本地/S3 两类存储
+  $providerNames = ['本地上传', '自建图床', '360图床', '七牛云', 'PlcGO图床', 'ImgURL图床', 'Telegraph图床', 'PHOTO图床', 'IMGLOC图床', 'LOC图床', '极速图床', '有图床', 'S3 兼容存储', '自定义 S3'];
+  ?>
+  <p class="providers-label">已内置 <?php echo (int)$apiCount;?> 个图床接口，覆盖本地上传、第三方图床与 S3 兼容存储</p>
+  <div class="marquee" aria-label="支持的图床接口">
+    <div class="marquee-track">
+      <?php for($set = 0; $set < 2; $set++): ?>
+      <div class="prov-set"<?php echo $set === 1 ? ' aria-hidden="true"' : '';?>>
+        <?php foreach($providerNames as $providerName): ?>
+        <span class="prov"><i></i><?php echo htmlspecialchars($providerName, ENT_QUOTES, 'UTF-8');?></span>
+        <?php endforeach; ?>
+      </div>
+      <?php endfor; ?>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 数据 ============ -->
+<section class="stats">
+  <div class="container">
+    <div class="stats-grid reveal">
+      <div class="stat">
+        <div class="stat-num"><span data-count="<?php echo (int)$apiCount;?>" data-decimals="0"><?php echo (int)$apiCount;?></span><em>个</em></div>
+        <div class="stat-label">内置图床接口</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num"><span>S3</span><em>兼容</em></div>
+        <div class="stat-label">对象存储接入</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num"><span data-count="3" data-decimals="0">3</span><em>种</em></div>
+        <div class="stat-label">上传入口</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num"><span><?php echo htmlspecialchars($defaultStorageText, ENT_QUOTES, 'UTF-8');?></span><em>默认</em></div>
+        <div class="stat-label">默认套餐配额</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 功能 Bento ============ -->
+<section class="section" id="features">
+  <div class="container">
+    <div class="sec-head reveal">
+      <div class="eyebrow">核心能力</div>
+      <h2>从上传到管理，一套账号就够了</h2>
+      <p>不需要在多个图床服务之间来回切换。接口、图片记录、套餐配额与 API 密钥都在同一套系统里。</p>
+    </div>
+
+    <div class="bento">
+      <!-- 多图床聚合 -->
+      <article class="bcard bcard--4 reveal">
+        <div class="bcard-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
+        </div>
+        <h3>多图床聚合</h3>
+        <p>内置 <?php echo (int)$apiCount;?> 个图床接口，并支持添加自定义 S3 存储。管理员可启停接口、设置默认接口，并按套餐分组授权可用范围。</p>
+        <div class="nodes">
+          <div class="node is-active">
+            <span class="node-dot"></span>
+            <span class="node-name">本地上传</span>
+            <span class="node-latency">可用</span>
+            <span class="node-flag">默认</span>
+          </div>
+          <div class="node">
+            <span class="node-dot"></span>
+            <span class="node-name">自建图床 / 360 图床</span>
+            <span class="node-latency">可用</span>
+          </div>
+          <div class="node">
+            <span class="node-dot"></span>
+            <span class="node-name">第三方公共图床</span>
+            <span class="node-latency">按套餐</span>
+          </div>
+          <div class="node">
+            <span class="node-dot"></span>
+            <span class="node-name">自定义 S3 存储</span>
+            <span class="node-latency">按配置</span>
+          </div>
         </div>
       </article>
 
-      <!-- 上传历史 -->
-      <section class="gallery-section soft-card" id="history">
-        <div class="section-heading">
-          <div>
-            <p class="section-caption">Upload History</p>
-            <h3>上传历史</h3>
+      <!-- 网页上传 -->
+      <article class="bcard reveal">
+        <div class="bcard-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z"/></svg>
+        </div>
+        <h3>网页与用户中心上传</h3>
+        <p>拖拽、粘贴或选择文件即可上传，登录后自动记录到用户中心；支持 JPG / PNG / GIF / WebP / BMP，具体上限以所选接口为准。</p>
+        <div class="compress">
+          <div class="cbar-row"><span style="width:60px;color:var(--ink);font-weight:700">网页上传</span><span>拖拽 / 粘贴 / 选择</span></div>
+          <div class="cbar-row"><span style="width:60px">API 上传</span><span>Bearer 密钥鉴权</span></div>
+        </div>
+      </article>
+
+      <!-- 图片管理 -->
+      <article class="bcard reveal">
+        <div class="bcard-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20V8"/></svg>
+        </div>
+        <h3>图片与套餐管理</h3>
+        <p>用户中心统一查看上传历史、复制链接、删除图片，并管理套餐配额、兑换码与 API 密钥。</p>
+        <div class="compress">
+          <div class="cbar-row"><span style="width:60px">默认配额</span><span><?php echo htmlspecialchars($defaultStorageText, ENT_QUOTES, 'UTF-8');?></span></div>
+          <div class="cbar-row"><span style="width:60px">用量统计</span><span>用户中心实时查看</span></div>
+          <span class="save-badge">套餐可升级</span>
+        </div>
+      </article>
+
+      <!-- 开放 API -->
+      <article class="bcard bcard--4 reveal">
+        <div class="bcard-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>
+        </div>
+        <h3>开放 API 上传</h3>
+        <p>一套 Bearer Token 鉴权的上传接口，支持服务端调用；传 <code>api</code> 选择图床接口，或用 <code>s3_id</code> 使用自定义 S3。</p>
+        <div class="mini-code" aria-hidden="true">
+          <div class="mini-code-bar"><i></i><i></i><i></i></div>
+          <pre><span class="c">// 上传并拿到图片直链</span>
+<span class="f">curl</span> <span class="p">-X POST</span> <?php echo htmlspecialchars($apiEndpoint, ENT_QUOTES, 'UTF-8');?> \
+  <span class="p">-H</span> <span class="s">"Authorization: Bearer sk-..."</span> \
+  <span class="p">-F</span> <span class="s">"file=@cover.jpg"</span> <span class="p">-F</span> <span class="s">"api=local"</span></pre>
+        </div>
+      </article>
+
+      <!-- 自定义 S3 -->
+      <article class="bcard bcard--3 reveal">
+        <div class="bcard-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>
+        </div>
+        <h3>自定义 S3 存储</h3>
+        <p>管理员可添加多个 S3 兼容存储，配置 Bucket、Region、访问域名与路径前缀，适合自有对象存储或私有部署。</p>
+        <div class="domain-stack">
+          <div class="domain-chip">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+            <span>s3.example.com</span><b>S3</b>
           </div>
-          <button class="ghost-btn small" id="clearHistoryBtn" type="button"><i class="mdi mdi-trash-can-outline"></i> 清空历史</button>
+          <div class="domain-chip">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z"/></svg>
+            <span>bucket / path-prefix</span><b>自定义</b>
+          </div>
         </div>
-        <div id="historyList">
-          <div class="history-empty">暂无上传记录</div>
-        </div>
-        <div style="text-align:center;margin-top:18px;">
-          <button class="ghost-btn" id="loadMoreBtn" type="button">加载更多</button>
-        </div>
-      </section>
+      </article>
 
-      <!-- 隐藏的引用元素（JS 需要） -->
-      <div class="hidden-ref">
-        <span id="detailName"></span>
-      </div>
-    </main>
+      <!-- 安全 -->
+      <article class="bcard bcard--3 reveal">
+        <div class="bcard-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7.5 4v5.2c0 4.7-3.2 7.8-7.5 9.3-4.3-1.5-7.5-4.6-7.5-9.3V7L12 3z"/><path d="M9 12l2 2 4-4"/></svg>
+        </div>
+        <h3>账号与接口权限</h3>
+        <p>密码 bcrypt 存储、CSRF 校验、API 密钥哈希与加密副本、独立登录会话；套餐可绑定可用接口分组。</p>
+        <div class="guard-tags">
+          <span>bcrypt 密码</span>
+          <span>CSRF 校验</span>
+          <span>API 密钥</span>
+          <span>套餐分组</span>
+          <span>会话隔离</span>
+        </div>
+      </article>
+    </div>
   </div>
+</section>
 
-  <!-- 站点通知弹窗 -->
-  <?php if(!empty($siteNotice)): ?>
-  <div class="notice-modal-overlay" id="noticeModalOverlay">
-    <div class="notice-modal">
-      <div class="notice-modal-head"><?php echo htmlspecialchars($siteName);?> 通知</div>
-      <div class="notice-modal-body"><?php echo htmlspecialchars($siteNotice);?></div>
-      <div class="notice-modal-foot">
-        <button class="notice-modal-btn" id="noticeModalClose">我知道了</button>
+<!-- ============ 三步接入 ============ -->
+<section class="section section--soft">
+  <div class="container">
+    <div class="sec-head reveal">
+      <div class="eyebrow">接入流程</div>
+      <h2>三步开始，先用默认套餐跑起来</h2>
+      <p>注册账号 → 创建 API 密钥 → 网页上传或调用接口。接口与存储由管理员统一配置，不需要自己维护服务器。</p>
+    </div>
+
+    <div class="steps">
+      <div class="step reveal">
+        <span class="step-num">STEP 01</span>
+        <h3>注册 / 登录账号</h3>
+        <p>注册后自动使用系统默认套餐；已有账号可直接登录用户中心查看配额与上传记录。</p>
+        <span class="step-code"><i></i><?php echo $regEnabled ? '免费注册' : '登录使用';?></span>
+      </div>
+      <div class="step reveal" style="transition-delay:.08s">
+        <span class="step-num">STEP 02</span>
+        <h3>创建 API 密钥</h3>
+        <p>在用户中心创建 Bearer 密钥，明文首次展示，之后可在列表中复制，无需再次记录。</p>
+        <span class="step-code"><i></i>sk-••••••••••••</span>
+      </div>
+      <div class="step reveal" style="transition-delay:.16s">
+        <span class="step-num">STEP 03</span>
+        <h3>上传并获取链接</h3>
+        <p>使用网页上传或调用 API，成功后返回图片直链；登录用户可在用户中心统一查看和删除。</p>
+        <span class="step-code"><i></i>200 OK · JSON</span>
       </div>
     </div>
   </div>
-  <script>
-    (function(){
-      var hash = '<?php echo $siteNoticeHash;?>';
-      var dismissed = localStorage.getItem('noticeDismissed_' + hash);
-      if(!dismissed){
-        setTimeout(function(){ document.getElementById('noticeModalOverlay').classList.add('show'); }, 500);
-      }
-      document.getElementById('noticeModalClose').addEventListener('click', function(){
-        document.getElementById('noticeModalOverlay').classList.remove('show');
-        localStorage.setItem('noticeDismissed_' + hash, '1');
-      });
-    })();
-  </script>
-  <?php endif; ?>
+</section>
 
-  <!-- 确认弹窗 -->
-  <div class="modal-overlay" id="modalOverlay">
-    <div class="modal-box">
-      <h3 class="modal-title" id="modalTitle"></h3>
-      <p class="modal-body" id="modalBody"></p>
-      <div class="modal-actions">
-        <button class="modal-btn cancel" id="modalCancel">取消</button>
-        <button class="modal-btn confirm" id="modalConfirm">确认</button>
+<!-- ============ API ============ -->
+<section class="section" id="api">
+  <div class="container api-wrap">
+    <div class="api-copy reveal">
+      <div class="eyebrow">开发者体验</div>
+      <h2>你写 Markdown<br>上传交给 API</h2>
+      <p>使用 Bearer API 密钥调用统一上传接口，图片上传到指定图床接口或自定义 S3，返回 JSON 直链。</p>
+
+      <ul class="api-list">
+        <li>
+          <span class="tick"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></span>
+          <div>
+            <strong>Bearer 密钥鉴权</strong>
+            <span>在用户中心创建 API 密钥，请求头携带 <code>Authorization: Bearer sk-...</code>。</span>
+          </div>
+        </li>
+        <li>
+          <span class="tick"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></span>
+          <div>
+            <strong>接口 / S3 二选一</strong>
+            <span><code>api</code> 传图床接口标识（如 <code>local</code>、<code>360</code>），或用 <code>s3_id</code> 使用自定义 S3。</span>
+          </div>
+        </li>
+        <li>
+          <span class="tick"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></span>
+          <div>
+            <strong>标准 JSON 返回</strong>
+            <span>成功返回图片直链、文件名、大小与接口类型；失败返回明确的错误码与提示。</span>
+          </div>
+        </li>
+      </ul>
+
+      <div class="api-clients">
+        适用于服务端脚本、自动化工具与支持自定义 HTTP 上传的客户端
+      </div>
+    </div>
+
+    <div class="codebox reveal" style="transition-delay:.08s">
+      <div class="codebox-head">
+        <div class="tabs" role="tablist" aria-label="接口示例">
+          <button class="tab" role="tab" aria-selected="true" aria-controls="panel-curl" id="tab-curl">cURL</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="panel-js" id="tab-js">JavaScript</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="panel-py" id="tab-py">Python</button>
+        </div>
+        <button class="copy-btn" data-copy-target="code-curl">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+          复制
+        </button>
+      </div>
+      <div class="code-body">
+        <div class="code-panel is-active" id="panel-curl" role="tabpanel" aria-labelledby="tab-curl">
+<pre id="code-curl"><span class="c"># 上传图片并得到 JSON 直链</span>
+<span class="f">curl</span> <span class="p">-X POST</span> <span class="s">"<?php echo htmlspecialchars($apiEndpoint, ENT_QUOTES, 'UTF-8');?>"</span> \
+  <span class="p">-H</span> <span class="s">"Authorization: Bearer sk-..."</span> \
+  <span class="p">-F</span> <span class="s">"file=@cover.jpg"</span> \
+  <span class="p">-F</span> <span class="s">"api=local"</span>
+
+<span class="c"># 200 OK</span>
+{
+  <span class="s">"code"</span>: <span class="n">200</span>,
+  <span class="s">"msg"</span>: <span class="s">"上传成功"</span>,
+  <span class="s">"data"</span>: {
+    <span class="s">"url"</span>: <span class="s">"https://example.com/image.png"</span>,
+    <span class="s">"filename"</span>: <span class="s">"cover.jpg"</span>,
+    <span class="s">"size"</span>: <span class="n">102400</span>,
+    <span class="s">"api_type"</span>: <span class="s">"local"</span>
+  }
+}</pre>
+        </div>
+
+        <div class="code-panel" id="panel-js" role="tabpanel" aria-labelledby="tab-js">
+<pre id="code-js"><span class="c">// 浏览器 / Node.js 使用 FormData 上传</span>
+<span class="k">const</span> form = <span class="k">new</span> <span class="f">FormData</span>();
+form.<span class="f">append</span>(<span class="s">"file"</span>, file);
+form.<span class="f">append</span>(<span class="s">"api"</span>, <span class="s">"local"</span>); <span class="c">// 或 form.append("s3_id", "0")</span>
+
+<span class="k">const</span> res = <span class="k">await</span> <span class="f">fetch</span>(<span class="s">"<?php echo htmlspecialchars($apiEndpoint, ENT_QUOTES, 'UTF-8');?>"</span>, {
+  method: <span class="s">"POST"</span>,
+  headers: { <span class="s">"Authorization"</span>: <span class="s">"Bearer sk-..."</span> },
+  body: form
+}).<span class="f">then</span>(r =&gt; r.<span class="f">json</span>());
+
+<span class="k">if</span> (res.code === <span class="n">200</span>) console.<span class="f">log</span>(res.data.url);</pre>
+        </div>
+
+        <div class="code-panel" id="panel-py" role="tabpanel" aria-labelledby="tab-py">
+<pre id="code-py"><span class="k">import</span> requests
+
+resp = requests.<span class="f">post</span>(
+    <span class="s">"<?php echo htmlspecialchars($apiEndpoint, ENT_QUOTES, 'UTF-8');?>"</span>,
+    headers={<span class="s">"Authorization"</span>: <span class="s">"Bearer sk-..."</span>},
+    files={<span class="s">"file"</span>: <span class="f">open</span>(<span class="s">"cover.jpg"</span>, <span class="s">"rb"</span>)},
+    data={<span class="s">"api"</span>: <span class="s">"local"</span>},  <span class="c"># 或 {"s3_id": "0"}</span>
+    timeout=<span class="n">30</span>,
+)
+
+<span class="f">print</span>(resp.<span class="f">json</span>()[<span class="s">"data"</span>][<span class="s">"url"</span>])</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 图片流 ============ -->
+<section class="section section--soft flow">
+  <div class="container">
+    <div class="sec-head reveal">
+      <div class="eyebrow">图片记录</div>
+      <h2>每一张图片，都有它的记录</h2>
+      <p>用户中心统一查看上传历史、复制链接与删除图片；管理员可查看全站图片记录。</p>
+    </div>
+  </div>
+
+  <div class="flow-rows" aria-hidden="true">
+    <div class="flow-row">
+      <div class="flow-track">
+        <div class="shot g1"><span class="shot-info"><span class="shot-name">mountain-sunrise.jpg</span><span class="shot-tag">LOCAL</span></span></div>
+        <div class="shot g2"><span class="shot-info"><span class="shot-name">forest-fog-02.webp</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g3"><span class="shot-info"><span class="shot-name">studio-portrait.png</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g4"><span class="shot-info"><span class="shot-name">ocean-wide.jpg</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g5"><span class="shot-info"><span class="shot-name">desert-dusk.jpg</span><span class="shot-tag">LOCAL</span></span></div>
+        <div class="shot g6"><span class="shot-info"><span class="shot-name">mint-abstract.webp</span><span class="shot-tag">MINIO</span></span></div>
+        <div class="shot g7"><span class="shot-info"><span class="shot-name">violet-gradient.png</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g1"><span class="shot-info"><span class="shot-name">mountain-sunrise.jpg</span><span class="shot-tag">LOCAL</span></span></div>
+        <div class="shot g2"><span class="shot-info"><span class="shot-name">forest-fog-02.webp</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g3"><span class="shot-info"><span class="shot-name">studio-portrait.png</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g4"><span class="shot-info"><span class="shot-name">ocean-wide.jpg</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g5"><span class="shot-info"><span class="shot-name">desert-dusk.jpg</span><span class="shot-tag">LOCAL</span></span></div>
+        <div class="shot g6"><span class="shot-info"><span class="shot-name">mint-abstract.webp</span><span class="shot-tag">MINIO</span></span></div>
+        <div class="shot g7"><span class="shot-info"><span class="shot-name">violet-gradient.png</span><span class="shot-tag">S3</span></span></div>
+      </div>
+    </div>
+
+    <div class="flow-row flow-row--rev">
+      <div class="flow-track">
+        <div class="shot g8"><span class="shot-info"><span class="shot-name">rose-field.jpg</span><span class="shot-tag">LOCAL</span></span></div>
+        <div class="shot g9"><span class="shot-info"><span class="shot-name">blue-hour-01.jpg</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g10"><span class="shot-info"><span class="shot-name">olive-leaf.webp</span><span class="shot-tag">360</span></span></div>
+        <div class="shot g11"><span class="shot-info"><span class="shot-name">lavender-mesh.png</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g12"><span class="shot-info"><span class="shot-name">peach-soft.jpg</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g1"><span class="shot-info"><span class="shot-name">banner-hero.webp</span><span class="shot-tag">CDN</span></span></div>
+        <div class="shot g3"><span class="shot-info"><span class="shot-name">product-shot-04.webp</span><span class="shot-tag">LOCAL</span></span></div>
+        <div class="shot g8"><span class="shot-info"><span class="shot-name">rose-field.jpg</span><span class="shot-tag">LOCAL</span></span></div>
+        <div class="shot g9"><span class="shot-info"><span class="shot-name">blue-hour-01.jpg</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g10"><span class="shot-info"><span class="shot-name">olive-leaf.webp</span><span class="shot-tag">360</span></span></div>
+        <div class="shot g11"><span class="shot-info"><span class="shot-name">lavender-mesh.png</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g12"><span class="shot-info"><span class="shot-name">peach-soft.jpg</span><span class="shot-tag">S3</span></span></div>
+        <div class="shot g1"><span class="shot-info"><span class="shot-name">banner-hero.webp</span><span class="shot-tag">CDN</span></span></div>
+        <div class="shot g3"><span class="shot-info"><span class="shot-name">product-shot-04.webp</span><span class="shot-tag">LOCAL</span></span></div>
       </div>
     </div>
   </div>
 
-  <!-- Toast 容器 -->
-  <div class="notif-container" id="notifContainer"></div>
+  <p class="flow-note reveal">图片存放位置取决于所选接口：本地上传存于服务器，S3 存于管理员配置的存储桶，第三方图床存于对应服务商。</p>
+</section>
 
-  <!-- qd 设计系统通用交互 -->
-  <script src="bd/qd.js"></script>
+<!-- ============ 价格 ============ -->
+<section class="section" id="pricing">
+  <div class="container">
+    <div class="sec-head reveal">
+      <div class="eyebrow">套餐与配额</div>
+      <h2>先用默认套餐，需要时再升级</h2>
+      <p>默认套餐无需付费即可使用；更高等级套餐由管理员配置，通过兑换码开通，到期后自动回退到默认套餐。</p>
+    </div>
+
+    <div class="price-grid<?php echo (count($packages) + 1) <= 2 ? ' price-grid--two' : '';?>">
+      <?php foreach($packages as $idx => $pkg):
+        $pkgStorage = $fmtBytes((int)$pkg['storage_limit']);
+        $pkgDays    = (int)$pkg['days'] === 0 ? '长期有效' : ((int)$pkg['days'] . ' 天有效期');
+        $pkgLabel   = (int)$pkg['level'] > 0 ? ('VIP' . (int)$pkg['level']) : 'Free';
+        $pkgIsDefault = !empty($pkg['is_default']);
+        $pkgCtaUrl  = $isUser ? $pricingUrl : ($regEnabled ? $registerUrl : $loginUrl);
+        $pkgCtaText = $isUser ? '查看我的套餐' : ($regEnabled ? '免费注册' : '登录使用');
+      ?>
+      <article class="plan reveal" style="transition-delay:<?php echo $idx * 0.08;?>s">
+        <?php if($pkgIsDefault): ?><span class="plan-badge">默认套餐</span><?php endif; ?>
+        <div class="plan-name"><?php echo htmlspecialchars($pkgLabel, ENT_QUOTES, 'UTF-8');?></div>
+        <h3><?php echo htmlspecialchars((string)$pkg['name'], ENT_QUOTES, 'UTF-8');?></h3>
+        <p class="plan-desc"><?php echo $pkgIsDefault ? '注册后自动使用，无需额外操作' : '由管理员配置的可用套餐';?></p>
+        <div class="plan-price"><b><?php echo htmlspecialchars($pkgStorage, ENT_QUOTES, 'UTF-8');?></b><span>存储配额</span></div>
+        <p class="plan-year"><?php echo htmlspecialchars($pkgDays, ENT_QUOTES, 'UTF-8');?></p>
+        <a href="<?php echo $pkgCtaUrl;?>" class="btn btn--ghost"><?php echo $pkgCtaText;?></a>
+        <ul class="plan-features">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><?php echo htmlspecialchars($pkgStorage, ENT_QUOTES, 'UTF-8');?> 存储配额</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>网页上传与图片管理</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>API 密钥上传</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>套餐绑定的可用接口</li>
+        </ul>
+      </article>
+      <?php endforeach; ?>
+
+      <article class="plan plan--pro reveal" style="transition-delay:<?php echo count($packages) * 0.08;?>s">
+        <span class="plan-badge">可升级</span>
+        <div class="plan-name">Custom</div>
+        <h3>更高等级套餐</h3>
+        <p class="plan-desc">适合需要更大存储或更多接口的用户</p>
+        <div class="plan-price"><b>按需</b><span>配额</span></div>
+        <p class="plan-year">由管理员配置，通过兑换码开通</p>
+        <a href="<?php echo $isUser ? $pricingUrl : $loginUrl;?>" class="btn btn--white"><?php echo $isUser ? '查看可用套餐' : '登录查看套餐';?></a>
+        <ul class="plan-features">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>更高存储配额</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>更多可用图床接口</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>兑换码自助开通</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>到期回退默认套餐</li>
+        </ul>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FAQ ============ -->
+<section class="section section--soft" id="faq">
+  <div class="container faq-wrap">
+    <div class="reveal">
+      <div class="eyebrow">常见问题</div>
+      <h2 style="font-size:clamp(1.8rem,3.2vw,2.3rem);margin-bottom:14px;">还有疑问？</h2>
+      <p style="font-size:14.5px;line-height:1.85;margin-bottom:22px;">这里整理了接入前最常被问到的几个点。套餐、接口与配额以管理员配置和用户中心实际显示为准。</p>
+      <a href="<?php echo $contactEmail !== '' ? 'mailto:' . htmlspecialchars($contactEmail, ENT_QUOTES, 'UTF-8') : '#faq';?>" class="btn btn--ghost" style="font-size:13.5px;padding:11px 18px;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>
+        <?php echo $contactEmail !== '' ? '联系支持' : '查看常见问题';?>
+      </a>
+    </div>
+
+    <div class="faq-list reveal" style="transition-delay:.08s">
+      <details class="faq-item" open>
+        <summary class="faq-q">这个系统和普通图床有什么区别？<span class="ico"></span></summary>
+        <div class="faq-a"><p>系统把 <?php echo (int)$apiCount;?> 个内置图床接口（含本地上传）与自定义 S3 存储统一到一套账号、套餐和图片记录中。上传时选择具体接口或默认接口，图片实际存放在对应服务商；系统不会自动跨源切换或承诺链接永久有效。</p></div>
+      </details>
+
+      <details class="faq-item">
+        <summary class="faq-q">我的图片实际存在哪里？<span class="ico"></span></summary>
+        <div class="faq-a"><p>取决于上传时选择的接口：本地上传存于本站服务器；S3 存储存于管理员配置的对象存储桶；第三方图床存于对应服务商。系统保存上传记录与图片链接，删除记录不会自动删除第三方服务商上的原图。</p></div>
+      </details>
+
+      <details class="faq-item">
+        <summary class="faq-q">支持哪些上传方式？<span class="ico"></span></summary>
+        <div class="faq-a"><p>登录用户中心后即可拖拽、粘贴或选择文件上传，并查看历史、复制链接和删除图片；服务端或自动化脚本可通过 API 上传。支持 JPG / PNG / GIF / WebP / BMP，具体大小与格式限制以所选接口为准。</p></div>
+      </details>
+
+      <details class="faq-item">
+        <summary class="faq-q">如何获取 API 密钥？<span class="ico"></span></summary>
+        <div class="faq-a"><p>登录用户中心 → API 密钥管理 → 创建密钥。明文首次展示，之后列表只显示前缀，但可以点击复制获取完整密钥；每个用户最多创建 20 个，可随时禁用、删除或重新生成。</p></div>
+      </details>
+
+      <details class="faq-item">
+        <summary class="faq-q">套餐和配额怎么算？<span class="ico"></span></summary>
+        <div class="faq-a"><p>注册后自动使用系统默认套餐（当前默认 <?php echo htmlspecialchars($defaultStorageText, ENT_QUOTES, 'UTF-8');?> 存储）。更高等级套餐由管理员配置，可通过兑换码开通；到期后自动回退默认套餐。具体可用接口由套餐绑定的接口分组决定。</p></div>
+      </details>
+
+      <details class="faq-item">
+        <summary class="faq-q">支持自动压缩、CDN 或自定义域名吗？<span class="ico"></span></summary>
+        <div class="faq-a"><p>不提供自动压缩或自动签发证书。S3 存储可由管理员配置访问域名与路径前缀；第三方图床的链接、限流和可用性由对应服务商决定。系统不承诺跨服务商自动切换。</p></div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CTA ============ -->
+<section class="cta-band">
+  <div class="container">
+    <div class="cta-inner reveal">
+      <div class="cta-content">
+        <div class="eyebrow">开始使用</div>
+        <h2>现在就把图片，收进一个账号</h2>
+        <p>注册后即可使用默认套餐，API 密钥在用户中心创建。网页上传与接口上传共用同一套图片记录。</p>
+        <div class="cta-actions">
+          <a href="<?php echo $primaryCtaUrl;?>" class="btn btn--white btn--lg"><?php echo htmlspecialchars($primaryCtaText, ENT_QUOTES, 'UTF-8');?>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+          <a href="<?php echo $apiDocUrl;?>" class="btn btn--onDark btn--lg">查看 API 文档</a>
+        </div>
+        <div class="cta-meta">
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>默认套餐 <?php echo htmlspecialchars($defaultStorageText, ENT_QUOTES, 'UTF-8');?></span>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>支持 API 密钥上传</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ============ Footer ============ -->
+<footer class="footer">
+  <div class="container">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <a href="./" class="logo">
+          <span class="logo-mark">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 15.5l8-10 8 10"/><circle cx="12" cy="18" r="2.1" fill="#fff" stroke="none"/>
+            </svg>
+          </span>
+          <span class="logo-text"><?php echo htmlspecialchars($siteName, ENT_QUOTES, 'UTF-8');?><em>聚合图床</em></span>
+        </a>
+        <p>把多个图床接口、本地上传与自定义 S3 收进一个账号，统一管理图片、套餐与 API 密钥。</p>
+        <span class="footer-status"><i></i><?php echo (int)$apiCount;?> 个接口 · 用户中心 · API 上传</span>
+      </div>
+
+      <div class="footer-col">
+        <h4>产品</h4>
+        <ul>
+          <li><a href="#features">功能概览</a></li>
+          <li><a href="#providers">图床接口</a></li>
+          <li><a href="#pricing">套餐配额</a></li>
+          <li><a href="#faq">常见问题</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>开发者</h4>
+        <ul>
+          <li><a href="<?php echo $apiDocUrl;?>">API 文档</a></li>
+          <li><a href="<?php echo $userCenterUrl;?>">用户中心</a></li>
+          <li><a href="<?php echo $userCenterUrl;?>">API 密钥</a></li>
+          <li><a href="#faq">常见问题</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>账户</h4>
+        <ul>
+          <?php if(!$isUser): ?><li><a href="<?php echo $loginUrl;?>">登录</a></li><?php endif; ?>
+          <?php if(!$isUser && $regEnabled): ?><li><a href="<?php echo $registerUrl;?>">注册</a></li><?php endif; ?>
+          <li><a href="<?php echo $pricingUrl;?>">套餐与兑换码</a></li>
+          <li><a href="<?php echo $userCenterUrl;?>">API 密钥</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>联系</h4>
+        <ul>
+          <?php if($contactEmail !== ''): ?>
+          <li><a href="mailto:<?php echo htmlspecialchars($contactEmail, ENT_QUOTES, 'UTF-8');?>"><?php echo htmlspecialchars($contactEmail, ENT_QUOTES, 'UTF-8');?></a></li>
+          <?php endif; ?>
+          <li><a href="<?php echo $userCenterUrl;?>">用户中心</a></li>
+          <?php if($icp !== ''): ?><li><span><?php echo htmlspecialchars($icp, ENT_QUOTES, 'UTF-8');?></span></li><?php endif; ?>
+          <li><a href="<?php echo $apiDocUrl;?>">接口说明</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer-bottom">
+      <span>&copy; <?php echo date('Y');?> <?php echo htmlspecialchars($siteName, ENT_QUOTES, 'UTF-8');?>. 保留所有权利。</span>
+      <div class="footer-bottom-links">
+        <a href="<?php echo $apiDocUrl;?>">API 文档</a>
+        <a href="<?php echo $pricingUrl;?>">套餐配额</a>
+        <a href="<?php echo $userCenterUrl;?>">用户中心</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<div class="toast" id="toast" role="status" aria-live="polite">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+  <span>已复制到剪贴板</span>
+</div>
 
 <script>
-// ===== CSRF 令牌（用于上传等 POST 请求） =====
-var csrfToken = '<?php echo function_exists("csrf_token") ? csrf_token() : ""; ?>';
+(function () {
+  'use strict';
 
-// ===== 全局工具 =====
-function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  /* ---------- 导航吸顶阴影 ---------- */
+  var nav = document.getElementById('nav');
+  var onScroll = function () {
+    nav.classList.toggle('is-stuck', window.scrollY > 8);
+  };
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
 
-// 复制联系邮箱到剪贴板
-function copyContactEmail(email) {
-  var icon = event.currentTarget.querySelector('.contact-copy-icon');
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(email).then(function() {
-      if (icon) { icon.className = 'mdi mdi-check contact-copy-icon'; }
-      setTimeout(function() { if (icon) { icon.className = 'mdi mdi-content-copy contact-copy-icon'; } }, 1500);
-    });
+  /* ---------- 移动端菜单 ---------- */
+  var toggle = document.getElementById('navToggle');
+  var mobile = document.getElementById('navMobile');
+  toggle.addEventListener('click', function () {
+    var open = toggle.getAttribute('aria-expanded') === 'true';
+    toggle.setAttribute('aria-expanded', String(!open));
+    mobile.classList.toggle('is-open', !open);
+    toggle.setAttribute('aria-label', open ? '展开菜单' : '收起菜单');
+  });
+  mobile.addEventListener('click', function (e) {
+    if (e.target.closest('a')) {
+      toggle.setAttribute('aria-expanded', 'false');
+      mobile.classList.remove('is-open');
+    }
+  });
+
+  /* ---------- 滚动进场 ---------- */
+  var reveals = document.querySelectorAll('.reveal');
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('is-in');
+          io.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -60px 0px' });
+    reveals.forEach(function (el) { io.observe(el); });
   } else {
-    var ta = document.createElement('textarea');
-    ta.value = email; document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); if (icon) { icon.className = 'mdi mdi-check contact-copy-icon'; } setTimeout(function() { if (icon) { icon.className = 'mdi mdi-content-copy contact-copy-icon'; } }, 1500); } catch(e) {}
-    document.body.removeChild(ta);
-  }
-}
-function escAttr(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-// L3: URL 协议白名单校验，防止 javascript:/vbscript:/data: 等 URL 注入
-function safeUrl(url) {
-  var u = String(url).trim().toLowerCase();
-  if(u === '' || u === '#') return url;
-  // 允许的协议白名单
-  if(/^(https?:|mailto:|tel:|ftp:|\/|\.\/|\.\.\/|#|data:image\/)/.test(u)) return url;
-  return ''; // 不安全协议返回空
-}
-
-// ===== 自定义通知 =====
-function notify(msg, type) {
-  type = type || 'info';
-  var icons = { success: 'mdi-check-circle', error: 'mdi-alert-circle', warning: 'mdi-alert', info: 'mdi-information' };
-  var el = document.createElement('div');
-  el.className = 'notif ' + type;
-  el.innerHTML = '<i class="mdi ' + (icons[type] || icons.info) + '"></i><span>' + esc(msg) + '</span>';
-  document.getElementById('notifContainer').appendChild(el);
-  setTimeout(function() {
-    el.classList.add('notif-out');
-    setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 300);
-  }, 2800);
-}
-
-// ===== 自定义确认框 =====
-function showConfirm(title, msg) {
-  return new Promise(function(resolve) {
-    document.getElementById('modalTitle').textContent = title;
-    document.getElementById('modalBody').textContent = msg;
-    document.getElementById('modalOverlay').classList.add('show');
-    var confirm = document.getElementById('modalConfirm');
-    var cancel = document.getElementById('modalCancel');
-    var overlay = document.getElementById('modalOverlay');
-    var c = confirm.cloneNode(true); confirm.parentNode.replaceChild(c, confirm);
-    var cc = cancel.cloneNode(true); cancel.parentNode.replaceChild(cc, cancel);
-    c.addEventListener('click', function() { overlay.classList.remove('show'); resolve(true); });
-    cc.addEventListener('click', function() { overlay.classList.remove('show'); resolve(false); });
-    overlay.addEventListener('click', function(e) { if (e.target === overlay) { overlay.classList.remove('show'); resolve(false); } }, { once: true });
-  });
-}
-
-// ===== DOM =====
-var apiSelect = document.getElementById('apiSelect');
-var dropZone = document.getElementById('dropZone');
-var fileInput = document.getElementById('fileInput');
-var fileHint = document.getElementById('fileHint');
-var fileListWrap = document.getElementById('fileListWrap');
-var fileListEl = document.getElementById('fileListEl');
-var fileCountEl = document.getElementById('fileCountEl');
-var uploadBtn = document.getElementById('uploadBtn');
-var uploadCountEl = document.getElementById('uploadCountEl');
-var btnIcon = document.getElementById('btnIcon');
-var btnLabel = document.getElementById('btnLabel');
-var clearAllBtn = document.getElementById('clearAllBtn');
-var statusText = document.getElementById('statusText');
-var progressWrap = document.getElementById('progressWrap');
-var progressTitle = document.getElementById('progressTitle');
-var progressDetail = document.getElementById('progressDetail');
-var progressBar = document.getElementById('progressBar');
-var resultWrap = document.getElementById('resultWrap');
-var successBox = document.getElementById('successBox');
-var errorBox = document.getElementById('errorBox');
-var errorMsg = document.getElementById('errorMsg');
-var resultLinkText = document.getElementById('resultLinkText');
-var copyBtn = document.getElementById('copyBtn');
-var historyList = document.getElementById('historyList');
-var clockDisplay = document.getElementById('clockDisplay');
-var maxSizeDisplay = document.getElementById('maxSizeDisplay');
-
-// ===== 状态 =====
-var files = [];
-var uploading = false;
-var uploadHistory = JSON.parse(localStorage.getItem('uploadHistory') || '[]');
-var isLoggedIn = <?php echo $isUserLoggedIn ? 'true' : 'false'; ?>;
-
-// ===== 主题切换 =====
-(function initTheme() {
-  var saved = localStorage.getItem('theme') || 'light';
-  document.documentElement.setAttribute('data-theme', saved);
-  var icon = document.querySelector('#themeToggle i');
-  if (icon) icon.className = saved === 'dark' ? 'mdi mdi-weather-sunny' : 'mdi mdi-weather-night';
-})();
-document.getElementById('themeToggle').addEventListener('click', function() {
-  var current = document.documentElement.getAttribute('data-theme');
-  var next = current === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('theme', next);
-  this.querySelector('i').className = next === 'dark' ? 'mdi mdi-weather-sunny' : 'mdi mdi-weather-night';
-  renderTrendChart();
-});
-
-// ===== 侧边栏 =====
-document.getElementById('menuToggle').addEventListener('click', function() {
-  document.getElementById('sidebar').classList.add('open');
-  document.getElementById('sidebarOverlay').classList.add('show');
-});
-document.getElementById('sidebarOverlay').addEventListener('click', function() {
-  document.getElementById('sidebar').classList.remove('open');
-  this.classList.remove('show');
-});
-document.querySelectorAll('.side-nav a').forEach(function(item) {
-  item.addEventListener('click', function(e) {
-    if (this.getAttribute('href') && this.getAttribute('href').startsWith('#')) {
-      document.getElementById('sidebar').classList.remove('open');
-      document.getElementById('sidebarOverlay').classList.remove('show');
-    }
-  });
-});
-
-// ===== 时钟 =====
-function tick() {
-  var n = new Date();
-  clockDisplay.querySelector('span').textContent = n.toLocaleString('zh-CN', { hour12: false });
-}
-tick(); setInterval(tick, 1000);
-
-// ===== 图床切换 =====
-function updateDetail() {
-  if (apiSelect.options.length === 0) return;
-  var opt = apiSelect.options[apiSelect.selectedIndex];
-  document.getElementById('detailName').textContent = opt.textContent;
-  document.getElementById('selectedHostName').textContent = opt.textContent;
-  var maxSize = parseFloat(opt.dataset.maxsize) || 10;
-  var sizeText = maxSize >= 1 ? (maxSize + ' MB') : (Math.round(maxSize * 1024) + ' KB');
-  maxSizeDisplay.textContent = sizeText;
-  document.getElementById('detailMaxSize').textContent = sizeText;
-}
-apiSelect.addEventListener('change', updateDetail);
-updateDetail();
-
-// ===== 统计 =====
-var hostCount = apiSelect.options.length;
-document.getElementById('hostCount').textContent = hostCount;
-
-// ===== 文件处理 =====
-function addFiles(newFiles) {
-  var imgs = Array.from(newFiles).filter(function(f) { return f.type.startsWith('image/'); });
-  if (imgs.length === 0) { notify('请选择图片文件 (JPG, PNG, GIF 等)', 'warning'); return; }
-  files = files.concat(imgs);
-  renderFiles();
-  fileInput.value = '';
-  notify('已添加 ' + imgs.length + ' 张图片', 'info');
-}
-
-function renderFiles() {
-  if (files.length === 0) {
-    fileListWrap.style.display = 'none';
-    // 恢复拖拽区默认状态
-    document.getElementById('dropZoneTitle').textContent = '点击选择或拖拽图片到此处';
-    document.getElementById('dropZoneSubtitle').style.display = '';
-    document.getElementById('dropZoneFileNames').style.display = 'none';
-    document.getElementById('dropZoneFileNames').innerHTML = '';
-    document.getElementById('dropZoneIcon').querySelector('i').className = 'mdi mdi-cloud-upload-outline';
-    document.getElementById('browseBtn').innerHTML = '<i class="mdi mdi-folder-open-outline"></i> 浏览文件';
-  }
-  else {
-    fileListWrap.style.display = 'block';
-    fileCountEl.textContent = files.length;
-    var h = '';
-    files.forEach(function(f, i) {
-      h += '<div class="queue-item">' +
-        '<i class="mdi mdi-file-image file-icon"></i>' +
-        '<div class="queue-info"><div class="name">' + esc(f.name) + '</div><div class="meta">' + (f.size / 1024).toFixed(1) + ' KB</div></div>' +
-        '<button class="queue-cancel" data-idx="' + i + '"><i class="mdi mdi-close"></i></button></div>';
-    });
-    fileListEl.innerHTML = h;
-    fileListEl.querySelectorAll('.queue-cancel').forEach(function(el) {
-      el.addEventListener('click', function() {
-        files.splice(parseInt(this.dataset.idx), 1);
-        renderFiles(); updateBtn();
-        notify('已移除该文件', 'info');
-      });
-    });
-
-    // 在拖拽区内显示已选文件名
-    var dzTitle = document.getElementById('dropZoneTitle');
-    var dzSubtitle = document.getElementById('dropZoneSubtitle');
-    var dzFileNames = document.getElementById('dropZoneFileNames');
-    var dzIcon = document.getElementById('dropZoneIcon').querySelector('i');
-
-    if (files.length === 1) {
-      dzTitle.textContent = files[0].name;
-      dzSubtitle.style.display = 'none';
-      dzIcon.className = 'mdi mdi-file-image-outline';
-    } else {
-      dzTitle.textContent = '已选择 ' + files.length + ' 个文件';
-      dzSubtitle.style.display = 'none';
-      dzIcon.className = 'mdi mdi-file-multiple-outline';
-    }
-    document.getElementById('browseBtn').innerHTML = '<i class="mdi mdi-check-circle-outline"></i> 已选中文件';
-
-    // 显示文件名列表（最多5个）
-    var nameHtml = '';
-    var showCount = Math.min(files.length, 5);
-    for (var i = 0; i < showCount; i++) {
-      var size = (files[i].size / 1024).toFixed(1);
-      nameHtml += '<div style="font-size:12px;color:var(--text-2);padding:2px 0;border-bottom:1px solid var(--border-2);">' +
-        '<i class="mdi mdi-image-outline" style="color:var(--primary);margin-right:4px;"></i>' + esc(files[i].name) +
-        ' <span style="color:var(--text-muted);">(' + size + ' KB)</span></div>';
-    }
-    if (files.length > 5) {
-      nameHtml += '<div style="font-size:11px;color:var(--text-muted);padding:2px 0;">还有 ' + (files.length - 5) + ' 个文件...</div>';
-    }
-    dzFileNames.innerHTML = nameHtml;
-    dzFileNames.style.display = 'block';
-  }
-  updateBtn();
-}
-
-function updateBtn() {
-  uploadBtn.disabled = uploadBtn.dataset.needLogin ? false : (files.length === 0 || uploading);
-  if(uploadCountEl) uploadCountEl.textContent = files.length;
-  statusText.textContent = files.length > 0 ? '已选 ' + files.length + ' 个文件' : '未选择文件';
-  if(clearAllBtn) clearAllBtn.style.display = (files.length > 0 && !uploading) ? '' : 'none';
-}
-
-// ===== 清空 =====
-async function clearFiles() {
-  if (files.length === 0) return;
-  if (await showConfirm('清空文件', '确定要清空所有已选文件吗？')) {
-    files = []; renderFiles(); notify('已清空所有文件', 'success');
-  }
-}
-async function clearHistory() {
-  if (uploadHistory.length === 0) return;
-  if (await showConfirm('清空历史', '确定要清空所有上传历史记录吗？')) {
-    uploadHistory = []; localStorage.setItem('uploadHistory', '[]'); renderHistory(); notify('已清空历史记录', 'success');
-  }
-}
-
-// ===== 拖拽/粘贴 =====
-dropZone.addEventListener('click', function() { fileInput.click(); });
-dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.classList.add('dragover'); });
-dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('dragover'); });
-dropZone.addEventListener('drop', function(e) { e.preventDefault(); dropZone.classList.remove('dragover'); if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
-fileInput.addEventListener('change', function(e) { if (e.target.files.length) addFiles(e.target.files); });
-document.addEventListener('paste', function(e) {
-  var items = e.clipboardData && e.clipboardData.items; if (!items) return;
-  var fs = [];
-  for (var i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { var f = items[i].getAsFile(); if (f) fs.push(f); } }
-  if (fs.length) { addFiles(fs); fileHint.textContent = '已粘贴 ' + fs.length + ' 张图片'; setTimeout(function() { fileHint.textContent = ''; }, 2000); }
-});
-
-// ===== 上传逻辑 =====
-uploadBtn.addEventListener('click', function() {
-  if (uploading) return;
-  if (uploadBtn.dataset.needLogin) { window.location.href = 'user/login.php'; return; }
-  if (files.length === 0) { notify('请先选择要上传的图片', 'warning'); return; }
-
-  uploading = true;
-  updateBtn();
-  btnIcon.className = 'mdi mdi-loading mdi-spin';
-  btnLabel.textContent = '上传中...';
-
-  resultWrap.style.display = 'none';
-  successBox.style.display = 'none';
-  errorBox.style.display = 'none';
-
-  progressWrap.style.display = 'block';
-  progressTitle.textContent = '正在上传...';
-  progressDetail.textContent = '准备上传 ' + files.length + ' 张图片';
-  progressBar.style.width = '0%';
-
-  var apiKey = apiSelect.value;
-  var opt = apiSelect.options[apiSelect.selectedIndex];
-  var isS3 = (opt.dataset.type === 's3');
-  var url = './api/upload.php';
-  var maxSize = parseFloat(opt.dataset.maxsize) || 10;
-  var maxBytes = maxSize * 1024 * 1024;
-  var done = 0, okList = [], errList = [];
-
-  var oversized = files.filter(function(f) { return f.size > maxBytes; });
-  if (oversized.length > 0) {
-    var sizeLabel = maxSize >= 1 ? (maxSize + ' MB') : (Math.round(maxSize * 1024) + ' KB');
-    oversized.forEach(function(f) { errList.push({ name: f.name, msg: '文件大小 ' + (f.size / 1024 / 1024).toFixed(1) + 'MB 超过限制 ' + sizeLabel }); });
-    files = files.filter(function(f) { return f.size <= maxBytes; });
-    if (files.length === 0) {
-      notify('所有文件都超过 ' + sizeLabel + ' 的大小限制', 'error');
-      finish();
-      return;
-    }
-    notify(oversized.length + ' 个文件超过大小限制已跳过', 'warning');
-    progressDetail.textContent = '准备上传 ' + files.length + ' 张图片（' + oversized.length + ' 张跳过）';
+    reveals.forEach(function (el) { el.classList.add('is-in'); });
   }
 
-  function next(idx) {
-    if (idx >= files.length) { finish(); return; }
-    var file = files[idx];
-    var fd = new FormData();
-    fd.append('file', file);
-    if (isS3) { fd.append('s3_id', opt.dataset.s3id); }
-    else { fd.append('api', apiKey); }
+  /* ---------- 数字滚动 ---------- */
+  var counters = document.querySelectorAll('[data-count]');
+  var runCount = function (el) {
+    var target = parseFloat(el.getAttribute('data-count'));
+    var dec = parseInt(el.getAttribute('data-decimals'), 10) || 0;
+    var dur = 1500, start = null;
 
-    progressTitle.textContent = '上传中 ' + (idx + 1) + ' / ' + files.length;
-    progressDetail.textContent = file.name;
-    progressBar.style.width = ((idx / files.length) * 100) + '%';
-
-    // F1 修复：CSRF token 改用 X-CSRF-Token Header 传递（与 M5 修复模式一致，不再放 Body）
-    fetch(url, { method: 'POST', body: fd, headers: { 'X-CSRF-Token': csrfToken } })
-      .then(function(res) {
-        if (!res.ok) {
-          return res.text().then(function(t) {
-            errList.push({ name: file.name, msg: '状态码 ' + res.status + (t ? '：' + t.substring(0, 200) : '') });
-            done++; next(idx + 1);
-          });
-        }
-        return res.text().then(function(raw) {
-          var body;
-          try { body = JSON.parse(raw); } catch(e) { body = null; }
-          var isObj = body && typeof body === 'object';
-          var code = isObj ? (Number(body.code) || (body.status === true ? 200 : 0)) : 0;
-          var ok = isObj && (body.status === true || code === 200);
-          var path = isObj ? (body.path || (body.data && body.data.links && body.data.links.url)) : '';
-          var msg = isObj ? (body.msg || body.message || '上传失败') : ('接口返回非 JSON：' + raw.substring(0, 100));
-          done++;
-          if (ok && path) { okList.push({ name: file.name, url: path }); }
-          else { errList.push({ name: file.name, msg: code ? '状态码 ' + code + (msg ? '：' + msg : '') : msg }); }
-          next(idx + 1);
-        });
-      })
-      .catch(function(err) {
-        done++;
-        errList.push({ name: file.name, msg: '网络错误：' + (err.message || '无法连接') });
-        next(idx + 1);
-      });
-  }
-
-  function finish() {
-    try {
-      progressBar.style.width = '100%';
-      setTimeout(function() { progressWrap.style.display = 'none'; }, 300);
-      resultWrap.style.display = 'block';
-
-      if (okList.length > 0) {
-        successBox.style.display = 'block';
-        errorBox.style.display = 'none';
-
-        var lastUrl = okList[okList.length - 1].url;
-        resultLinkText.value = okList.length === 1 ? lastUrl : ('共 ' + okList.length + ' 张，最后一张：' + lastUrl);
-        resultLinkText._allLinks = okList.map(function(x) { return x.url; }).join('\n');
-
-        okList.forEach(function(item) {
-          uploadHistory.unshift({ time: new Date().toLocaleString('zh-CN', { hour12: false }), file: item.name, url: item.url });
-        });
-        if (uploadHistory.length > 200) uploadHistory = uploadHistory.slice(0, 200);
-        localStorage.setItem('uploadHistory', JSON.stringify(uploadHistory));
-        renderHistory();
-
-        var msg = okList.length === 1 ? '上传成功！' : (okList.length + ' 张上传成功');
-        if (errList.length > 0) msg += '，' + errList.length + ' 张失败';
-        notify(msg, 'success');
-      }
-
-      if (errList.length > 0) {
-        errorBox.style.display = 'block';
-        errorMsg.textContent = errList.map(function(x) { return x.name + ': ' + x.msg; }).join('\n');
-        if (okList.length === 0) {
-          successBox.style.display = 'none';
-          notify('上传失败，请检查网络或图床配置', 'error');
-        }
-      }
-
-      if (okList.length > 0 || errList.length > 0) {
-        recordStats(okList.length, errList.length);
-      }
-    } finally {
-      files = [];
-      renderFiles();
-      uploading = false;
-      btnIcon.className = 'mdi mdi-upload';
-      btnLabel.textContent = '上传';
-      if(uploadCountEl) uploadCountEl.textContent = '0';
-      uploadBtn.disabled = uploadBtn.dataset.needLogin ? false : true;
-    }
-  }
-
-  next(0);
-});
-
-// ===== 服务端统计同步 =====
-function recordStats(successCnt, failCnt) {
-  var fd = new FormData();
-  fd.append('success', successCnt);
-  fd.append('fail', failCnt);
-  // F1 修复：CSRF token 改用 X-CSRF-Token Header 传递（与 M5 修复模式一致，不再放 Body）
-  fetch('./api/stats.php', { method: 'POST', body: fd, headers: { 'X-CSRF-Token': csrfToken } })
-    .then(function(r) { return r.json(); })
-    .then(function(d) { if (d.status) updateStatDisplay(d); }).catch(function() {});
-}
-
-function fetchStats() {
-  fetch('./api/stats.php')
-    .then(function(r) { return r.json(); })
-    .then(function(d) { if (d.status) updateStatDisplay(d); }).catch(function() {});
-}
-
-function updateStatDisplay(d) {
-  document.getElementById('totalUploads').textContent = d.total_success.toLocaleString();
-  document.getElementById('todayUploads').textContent = d.today_success;
-  var totalAttempts = d.total_success + d.total_fail;
-  var rate = totalAttempts > 0 ? Math.round((d.total_success / totalAttempts) * 100) : 100;
-  document.getElementById('successRate').textContent = rate + '%';
-  localStorage.setItem('totalUploads', d.total_success);
-  localStorage.setItem('todayUploads', d.today_success);
-
-  // 更新趋势图数据
-  updateTrendData(d.today_success);
-
-  // 如果服务端返回了趋势数据，用真实数据替换
-  if (d.trend) {
-    updateTrendFromServer(d.trend);
-  }
-}
-
-// ===== 我的存储（与个人中心一致：真实配额，来源 package_info）=====
-function formatSize(bytes){
-  bytes = parseInt(bytes) || 0;
-  if(bytes < 1024) return bytes + ' B';
-  if(bytes < 1048576) return (bytes/1024).toFixed(1) + ' KB';
-  if(bytes < 1073741824) return (bytes/1048576).toFixed(2) + ' MB';
-  return (bytes/1073741824).toFixed(2) + ' GB';
-}
-
-function loadStorageWidget(){
-  var fillEl = document.getElementById('storageFill');
-  if(!fillEl) return; // 未登录不显示该模块
-  fetch('./api/user_api.php?action=package_info&_t=' + Date.now())
-    .then(function(r){ return r.json(); })
-    .then(function(d){
-      if(d.code !== 0 || !d.data) return;
-      var used = parseInt(d.data.storage_used) || 0;
-      var limit = parseInt(d.data.storage_limit);
-      if(isNaN(limit)) limit = 0;
-      var isUnlimited = (limit === -1);
-      var pct = 0;
-      if(!isUnlimited && limit > 0){
-        pct = Math.min(100, Math.round((used / limit) * 100));
-      }
-      fillEl.style.width = isUnlimited ? '100%' : Math.max(pct, 4) + '%';
-      var tagEl = document.getElementById('storageTag');
-      if(tagEl){
-        if(isUnlimited){ tagEl.textContent = '无限'; tagEl.style.background = ''; tagEl.style.color = ''; }
-        else if(pct >= 90){ tagEl.textContent = '已满'; tagEl.style.background = 'rgba(255,71,87,0.12)'; tagEl.style.color = 'var(--danger)'; }
-        else if(pct >= 70){ tagEl.textContent = '紧张'; tagEl.style.background = 'rgba(255,166,0,0.12)'; tagEl.style.color = 'var(--warning)'; }
-        else { tagEl.textContent = '正常'; tagEl.style.background = ''; tagEl.style.color = ''; }
-      }
-      var usedEl = document.getElementById('storageUsed');
-      if(usedEl) usedEl.textContent = '已用 ' + formatSize(used);
-      var totalEl = document.getElementById('storageTotal');
-      if(totalEl) totalEl.textContent = isUnlimited ? '上限 无限制' : '上限 ' + formatSize(limit);
-    })
-    .catch(function(){});
-}
-loadStorageWidget();
-
-// ===== 弹窗通知（首次打开弹出，关闭后不再弹出，直到内容变更）=====
-(function(){
-  var overlay = document.getElementById('noticeModalOverlay');
-  if(!overlay) return;
-  var noticeHash = '<?php echo $siteNoticeHash;?>';
-  var STORAGE_KEY = 'site_notice_closed_hash';
-  var savedHash = null;
-  try { savedHash = localStorage.getItem(STORAGE_KEY); } catch(e){}
-  if(savedHash !== noticeHash){
-    overlay.classList.add('show');
-  }
-  document.getElementById('noticeModalClose').addEventListener('click', function(){
-    overlay.classList.remove('show');
-    try { localStorage.setItem(STORAGE_KEY, noticeHash); } catch(e){}
-  });
-})();
-
-// ===== 历史从API获取 =====
-function fetchHistoryFromApi() {
-  fetch('./api/v1/images?page=1&order=newest')
-    .then(function(r) { return r.json(); })
-    .then(function(body) {
-      if (body.status === true && body.data && body.data.data && body.data.data.length > 0) {
-        var seen = {};
-        uploadHistory.forEach(function(h) { seen[h.url] = true; });
-        body.data.data.forEach(function(img) {
-          var url = (img.links && img.links.url) || '';
-          if (url && !seen[url]) {
-            uploadHistory.unshift({ time: img.date || img.human_date || '', file: img.name || '', url: url });
-            seen[url] = true;
-          }
-        });
-        if (uploadHistory.length > 200) uploadHistory = uploadHistory.slice(0, 200);
-        localStorage.setItem('uploadHistory', JSON.stringify(uploadHistory));
-        renderHistory();
-      }
-    }).catch(function() {});
-}
-
-// ===== 复制 =====
-copyBtn.addEventListener('click', function() {
-  var text = resultLinkText._allLinks || resultLinkText.value;
-  if (!text) { notify('没有可复制的链接', 'warning'); return; }
-
-  var origHTML = copyBtn.innerHTML;
-  copyBtn.innerHTML = '<i class="mdi mdi-check"></i> 已复制';
-  copyBtn.style.background = 'var(--success)';
-
-  var done = function(ok) {
-    notify(ok ? '链接已复制到剪贴板！' : '复制失败，请手动复制', ok ? 'success' : 'error');
-    setTimeout(function() {
-      copyBtn.innerHTML = origHTML;
-      copyBtn.style.background = '';
-    }, 2000);
+    var tick = function (now) {
+      if (!start) start = now;
+      var p = Math.min((now - start) / dur, 1);
+      var eased = 1 - Math.pow(1 - p, 3);
+      var val = target * eased;
+      el.textContent = dec > 0
+        ? val.toFixed(dec)
+        : Math.round(val).toLocaleString('en-US');
+      if (p < 1) requestAnimationFrame(tick);
+      else el.textContent = dec > 0 ? target.toFixed(dec) : target.toLocaleString('en-US');
+    };
+    requestAnimationFrame(tick);
   };
 
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(function() { done(true); }).catch(function() { fallbackCopy(text, done); });
-    } else { fallbackCopy(text, done); }
-  } catch(e) { fallbackCopy(text, done); }
-
-  function fallbackCopy(t, cb) {
-    var ta = document.createElement('textarea');
-    ta.value = t; ta.style.position = 'fixed'; ta.style.left = '-9999px'; ta.style.top = '0';
-    document.body.appendChild(ta); ta.focus(); ta.select();
-    try { document.execCommand('copy'); cb(true); } catch(e) { cb(false); }
-    document.body.removeChild(ta);
+  if ('IntersectionObserver' in window) {
+    var ioNum = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          runCount(entry.target);
+          ioNum.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.6 });
+    counters.forEach(function (el) { ioNum.observe(el); });
+  } else {
+    counters.forEach(runCount);
   }
-});
 
-// ===== 图片预览代理 =====
-function getPreviewUrl(url) {
-  var proxyDomains = ['oss.yootn.com'];
-  var baiduDomains = ['z1.oocc.top'];
-  for (var i = 0; i < proxyDomains.length; i++) {
-    if (url.indexOf(proxyDomains[i]) !== -1) return './api/imgbrige.php?url=' + encodeURIComponent(url);
-  }
-  for (var j = 0; j < baiduDomains.length; j++) {
-    if (url.indexOf(baiduDomains[j]) !== -1) return 'https://image.baidu.com/search/down?url=' + encodeURIComponent(url);
-  }
-  return url;
-}
+  /* ---------- 代码 Tab 切换 ---------- */
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+  var copyBtn = document.querySelector('.copy-btn');
 
-// ===== 历史渲染 =====
-function buildHistoryItem(item) {
-  var thumb = escAttr(safeUrl(getPreviewUrl(item.url)));
-  return '<div class="history-item">' +
-    '<div class="history-thumb">' +
-      '<img src="' + thumb + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'\';" loading="lazy">' +
-      '<i class="mdi mdi-file-image" style="display:none;"></i>' +
-    '</div>' +
-    '<div class="history-info"><div class="name">' + esc(item.file) + '</div><div class="meta">' + esc(item.time) + '</div></div>' +
-    '<a href="' + escAttr(safeUrl(item.url)) + '" target="_blank" rel="noopener" class="history-link"><i class="mdi mdi-open-in-new"></i></a></div>';
-}
+  var activate = function (tab) {
+    tabs.forEach(function (t) {
+      var on = t === tab;
+      t.setAttribute('aria-selected', String(on));
+      var panel = document.getElementById(t.getAttribute('aria-controls'));
+      if (panel) panel.classList.toggle('is-active', on);
+    });
+    if (copyBtn) copyBtn.setAttribute('data-copy-target', 'code-' + tab.id.replace('tab-', ''));
+  };
 
-function renderHistory() {
-  if (uploadHistory.length === 0) {
-    historyList.innerHTML = '<div class="history-empty">暂无上传记录</div>';
-    return;
-  }
-  historyList.innerHTML = uploadHistory.slice(0, 8).map(buildHistoryItem).join('');
-}
-
-document.getElementById('loadMoreBtn').addEventListener('click', function() {
-  var cur = historyList.querySelectorAll('.history-item').length;
-  var show = uploadHistory.slice(0, cur + 10);
-  historyList.innerHTML = show.map(buildHistoryItem).join('');
-  if (cur + 10 >= uploadHistory.length) { this.innerHTML = '已加载全部'; this.disabled = true; }
-});
-
-// ===== 事件绑定 =====
-document.getElementById('clearFilesBtn').addEventListener('click', clearFiles);
-if(clearAllBtn) clearAllBtn.addEventListener('click', clearFiles);
-document.getElementById('clearHistoryBtn').addEventListener('click', clearHistory);
-
-// ===== 趋势图 =====
-var trendData = {
-  week: { labels: ['周一','周二','周三','周四','周五','周六','周日'], data: [0,0,0,0,0,0,0] },
-  month: { labels: ['第1周','第2周','第3周','第4周'], data: [0,0,0,0] },
-  year: { labels: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'], data: [0,0,0,0,0,0,0,0,0,0,0,0] }
-};
-var currentRange = 'week';
-var trendLoaded = false; // 是否已从服务端加载过真实数据
-
-// 从服务端趋势数据更新本地
-function updateTrendFromServer(serverTrend) {
-  if (!serverTrend) return;
-  if (serverTrend.week && serverTrend.week.data) {
-    trendData.week.labels = serverTrend.week.labels || trendData.week.labels;
-    trendData.week.data = serverTrend.week.data;
-  }
-  if (serverTrend.month && serverTrend.month.data) {
-    trendData.month.labels = serverTrend.month.labels || trendData.month.labels;
-    trendData.month.data = serverTrend.month.data;
-  }
-  if (serverTrend.year && serverTrend.year.data) {
-    trendData.year.labels = serverTrend.year.labels || trendData.year.labels;
-    trendData.year.data = serverTrend.year.data;
-  }
-  trendLoaded = true;
-  renderTrendChart();
-}
-
-function updateTrendData(todayCount) {
-  // 在服务端数据未到达前，用今日上传量临时填充本周今天的数据
-  if (!trendLoaded) {
-    var today = new Date().getDay();
-    today = today === 0 ? 6 : today - 1;
-    trendData.week.data[today] = todayCount;
-    renderTrendChart();
-  }
-}
-
-function renderTrendChart() {
-  var data = trendData[currentRange].data;
-  var n = data.length;
-
-  // 更新汇总数字（不渲染图表）
-  var total = data.reduce(function(a,b) { return a+b; }, 0);
-  var avg = n > 0 ? Math.round(total / n) : 0;
-  var peak = Math.max.apply(null, data);
-  var min = Math.min.apply(null, data);
-  document.getElementById('trendTotal').textContent = total;
-  document.getElementById('trendAvg').textContent = avg;
-  document.getElementById('trendPeak').textContent = peak;
-  document.getElementById('trendMin').textContent = min;
-}
-
-// 趋势图切换
-document.querySelectorAll('.chart-tab').forEach(function(tab) {
-  tab.addEventListener('click', function() {
-    document.querySelectorAll('.chart-tab').forEach(function(t) { t.classList.remove('active'); });
-    this.classList.add('active');
-    currentRange = this.dataset.range;
-    renderTrendChart();
+  tabs.forEach(function (tab, i) {
+    tab.addEventListener('click', function () { activate(tab); });
+    tab.addEventListener('keydown', function (e) {
+      if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+      e.preventDefault();
+      var next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+      next.focus();
+      activate(next);
+    });
   });
-});
 
-// ===== 初始化 =====
-(function init() {
-  renderFiles();
-  renderHistory();
+  /* ---------- 复制 + Toast ---------- */
+  var toast = document.getElementById('toast');
+  var toastTimer;
+  var showToast = function (msg) {
+    toast.querySelector('span').textContent = msg || '已复制到剪贴板';
+    toast.classList.add('is-on');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toast.classList.remove('is-on'); }, 1900);
+  };
 
-  // 缓存显示
-  var cachedTotal = localStorage.getItem('totalUploads') || '0';
-  var cachedToday = localStorage.getItem('todayUploads') || '0';
-  document.getElementById('totalUploads').textContent = parseInt(cachedTotal).toLocaleString();
-  document.getElementById('todayUploads').textContent = cachedToday;
+  var copyText = function (text, msg) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { showToast(msg); })
+        .catch(function () { legacyCopy(text, msg); });
+    } else {
+      legacyCopy(text, msg);
+    }
+  };
 
-  // 初始化趋势图：先用缓存今日数据临时填充，等服务端数据到达后替换
-  var todayUploads = parseInt(cachedToday || '0');
-  var today = new Date().getDay();
-  today = today === 0 ? 6 : today - 1;
-  trendData.week.data[today] = todayUploads;
+  var legacyCopy = function (text, msg) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); showToast(msg); } catch (err) { showToast('复制失败，请手动选择'); }
+    document.body.removeChild(ta);
+  };
 
-  renderTrendChart();
-  fetchStats();
-  fetchHistoryFromApi();
+  if (copyBtn) {
+    copyBtn.addEventListener('click', function () {
+      var el = document.getElementById(copyBtn.getAttribute('data-copy-target'));
+      var pre = el ? (el.tagName === 'PRE' ? el : el.querySelector('pre')) : null;
+      if (!pre) return;
+      copyText(pre.innerText, '代码已复制');
+    });
+  }
 })();
 </script>
+
 </body>
 </html>

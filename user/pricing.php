@@ -436,6 +436,7 @@ if(typeof window.__pricingEmbedInit === 'undefined'){
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/x-icon" href="<?php echo htmlspecialchars(site_favicon_href('../'), ENT_QUOTES, 'UTF-8');?>">
   <title>套餐购买 - <?php echo htmlspecialchars($siteName);?></title>
   <link href="../admin/style/css/materialdesignicons.min.css" rel="stylesheet">
   <link href="../bd/qd.css" rel="stylesheet">
